@@ -14,6 +14,10 @@ requires_argument = true
 description = "Run Crystal compiler type check and report Nil-risk diagnostics"
 requires_argument = true
 
+[slash_commands.crystal-spec]
+description = "Run Crystal specs and show inline failure annotations with expected/actual diffs"
+requires_argument = false
+
 [grammars.crystal]
 repository = "https://github.com/crystal-lang-tools/tree-sitter-crystal"
 commit = "50ca9e6fcfb16a2cbcad59203cfd8ad650e25c49"

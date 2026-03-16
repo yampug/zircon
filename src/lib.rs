@@ -1,5 +1,6 @@
 mod analyzer;
 mod semantic;
+mod spec_runner;
 #[cfg(test)]
 mod analyzer_test;
 
@@ -104,6 +105,7 @@ impl zed::Extension for CrystalliZedExtension {
         match command.name.as_str() {
             "crystal-expand" => self.run_macro_expand(args, worktree),
             "crystal-check" => self.run_crystal_check(args, worktree),
+            "crystal-spec" => self.run_crystal_spec(args, worktree),
             _ => Err(format!("unknown command: {}", command.name)),
         }
     }
@@ -131,6 +133,18 @@ impl zed::Extension for CrystalliZedExtension {
                 new_text: "file.cr".to_string(),
                 run_command: true,
             }]),
+            "crystal-spec" => Ok(vec![
+                zed::SlashCommandArgumentCompletion {
+                    label: "spec/file_spec.cr".to_string(),
+                    new_text: "spec/file_spec.cr".to_string(),
+                    run_command: true,
+                },
+                zed::SlashCommandArgumentCompletion {
+                    label: "spec/ (run all)".to_string(),
+                    new_text: "spec/".to_string(),
+                    run_command: true,
+                },
+            ]),
             _ => Ok(Vec::new()),
         }
     }
@@ -253,6 +267,54 @@ impl CrystalliZedExtension {
                     file_path,
                     diagnostics.len()
                 ),
+            }],
+        })
+    }
+
+    fn run_crystal_spec(
+        &self,
+        args: Vec<String>,
+        _worktree: Option<&zed::Worktree>,
+    ) -> Result<zed::SlashCommandOutput, String> {
+        let spec_path = args.first().map(|s| s.as_str()).unwrap_or("spec/");
+
+        let output = zed::process::Command::new("crystal")
+            .arg("spec")
+            .arg(spec_path)
+            .arg("--no-color")
+            .output()
+            .map_err(|e| format!("failed to run crystal spec: {e}"))?;
+
+        let combined = {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stdout.is_empty() {
+                stdout.to_string()
+            } else {
+                stderr.to_string()
+            }
+        };
+
+        let result = spec_runner::parse_spec_output(&combined);
+        let text = spec_runner::format_inline_annotations(&result);
+
+        let label = if result.failures.is_empty() {
+            format!("Specs passed: {}", spec_path)
+        } else {
+            format!(
+                "Spec failures: {} ({}/{})",
+                spec_path, result.failed, result.total
+            )
+        };
+
+        Ok(zed::SlashCommandOutput {
+            text: text.clone(),
+            sections: vec![zed::SlashCommandOutputSection {
+                range: zed::Range {
+                    start: 0,
+                    end: text.len() as u32,
+                },
+                label,
             }],
         })
     }
