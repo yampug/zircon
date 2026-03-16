@@ -5,3 +5,7 @@ schema_version = 1
 authors = ["Bob"]
 description = "Crystal language support for Zed"
 repository = "https://github.com/nook/zed-crystal"
+
+[grammars.crystal]
+repository = "https://github.com/crystal-lang-tools/tree-sitter-crystal"
+commit = "50ca9e6fcfb16a2cbcad59203cfd8ad650e25c49"
