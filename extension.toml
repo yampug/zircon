@@ -1,10 +1,15 @@
-id = "crystallized"
-name = "CrystalliZed"
+id = "zircon"
+name = "Zircon for Crystal"
 version = "0.0.1"
 schema_version = 1
 authors = ["Bob"]
 description = "Crystal language support for Zed"
 repository = "https://github.com/nook/zed-crystal"
+languages = ["languages/crystal"]
+
+[lib]
+kind = "Rust"
+version = "0.7.0"
 
 [slash_commands.crystal-expand]
 description = "Expand Crystal macros using `crystal tool expand`"
