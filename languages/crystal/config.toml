@@ -3,3 +3,6 @@ grammar = "crystal"
 path_suffixes = ["cr"]
 line_comments = ["# "]
 language_servers = ["crystalline"]
+
+[formatter]
+external = { command = "crystal", arguments = ["tool", "format", "-"] }
