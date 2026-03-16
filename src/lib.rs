@@ -1,10 +1,10 @@
 mod analyzer;
+mod semantic;
 #[cfg(test)]
 mod analyzer_test;
 
 use std::fs;
 use zed_extension_api::{self as zed, Result};
-use analyzer::Analyzer;
 
 struct CrystalliZedExtension {
     cached_binary_path: Option<String>,
@@ -36,6 +36,65 @@ impl zed::Extension for CrystalliZedExtension {
         })
     }
 
+    fn label_for_completion(
+        &self,
+        _language_server_id: &zed::LanguageServerId,
+        completion: zed::lsp::Completion,
+    ) -> Option<zed::CodeLabel> {
+        let kind = completion.kind.as_ref()?;
+        let label = &completion.label;
+        let name_highlight = semantic::highlight_for_completion_kind(kind);
+
+        let mut spans = vec![zed::CodeLabelSpan::literal(
+            label,
+            Some(name_highlight.to_string()),
+        )];
+
+        if let Some(detail) = &completion.detail {
+            if !detail.is_empty() {
+                let type_highlight = semantic::highlight_for_type(detail);
+                spans.push(zed::CodeLabelSpan::literal(
+                    " : ",
+                    Some("punctuation.delimiter".to_string()),
+                ));
+                spans.push(zed::CodeLabelSpan::literal(
+                    detail,
+                    Some(type_highlight.to_string()),
+                ));
+            }
+        }
+
+        Some(zed::CodeLabel {
+            code: label.clone(),
+            spans,
+            filter_range: zed::Range {
+                start: 0,
+                end: label.len() as u32,
+            },
+        })
+    }
+
+    fn label_for_symbol(
+        &self,
+        _language_server_id: &zed::LanguageServerId,
+        symbol: zed::lsp::Symbol,
+    ) -> Option<zed::CodeLabel> {
+        let name = &symbol.name;
+        let highlight = semantic::highlight_for_symbol_kind(&symbol.kind);
+
+        Some(zed::CodeLabel {
+            code: name.clone(),
+            spans: vec![zed::CodeLabelSpan::literal(
+                name,
+                Some(highlight.to_string()),
+            )],
+            filter_range: zed::Range {
+                start: 0,
+                end: name.len() as u32,
+            },
+        })
+    }
+
     fn run_slash_command(
         &self,
         command: zed::SlashCommand,
@@ -44,6 +103,7 @@ impl zed::Extension for CrystalliZedExtension {
     ) -> Result<zed::SlashCommandOutput, String> {
         match command.name.as_str() {
             "crystal-expand" => self.run_macro_expand(args, worktree),
+            "crystal-check" => self.run_crystal_check(args, worktree),
             _ => Err(format!("unknown command: {}", command.name)),
         }
     }
@@ -66,6 +126,11 @@ impl zed::Extension for CrystalliZedExtension {
                     run_command: false,
                 },
             ]),
+            "crystal-check" => Ok(vec![zed::SlashCommandArgumentCompletion {
+                label: "file.cr".to_string(),
+                new_text: "file.cr".to_string(),
+                run_command: true,
+            }]),
             _ => Ok(Vec::new()),
         }
     }
@@ -119,6 +184,75 @@ impl CrystalliZedExtension {
                     end: text.len() as u32,
                 },
                 label,
+            }],
+        })
+    }
+
+    fn run_crystal_check(
+        &self,
+        args: Vec<String>,
+        _worktree: Option<&zed::Worktree>,
+    ) -> Result<zed::SlashCommandOutput, String> {
+        let file_path = args
+            .first()
+            .ok_or("usage: /crystal-check <file>")?;
+
+        let output = zed::process::Command::new("crystal")
+            .arg("build")
+            .arg("--no-codegen")
+            .arg("-f")
+            .arg("json")
+            .arg(file_path.as_str())
+            .output()
+            .map_err(|e| format!("failed to run crystal build: {e}"))?;
+
+        let json_src = if !output.stdout.is_empty() {
+            String::from_utf8_lossy(&output.stdout).to_string()
+        } else {
+            String::from_utf8_lossy(&output.stderr).to_string()
+        };
+
+        let diagnostics = semantic::parse_diagnostics(&json_src);
+
+        if diagnostics.is_empty() {
+            let text = format!("No type issues found in `{}`.", file_path);
+            return Ok(zed::SlashCommandOutput {
+                text: text.clone(),
+                sections: vec![zed::SlashCommandOutputSection {
+                    range: zed::Range {
+                        start: 0,
+                        end: text.len() as u32,
+                    },
+                    label: format!("Crystal check: {}", file_path),
+                }],
+            });
+        }
+
+        let mut text = String::new();
+        for d in &diagnostics {
+            let nil_tag = if semantic::is_nil_risk(&d.message) {
+                " [nil-risk]"
+            } else {
+                ""
+            };
+            text.push_str(&format!(
+                "{}:{}:{} [{}]{}\n  {}\n\n",
+                d.file, d.line, d.column, d.severity, nil_tag, d.message
+            ));
+        }
+
+        Ok(zed::SlashCommandOutput {
+            text: text.clone(),
+            sections: vec![zed::SlashCommandOutputSection {
+                range: zed::Range {
+                    start: 0,
+                    end: text.len() as u32,
+                },
+                label: format!(
+                    "Crystal check: {} ({} issues)",
+                    file_path,
+                    diagnostics.len()
+                ),
             }],
         })
     }
