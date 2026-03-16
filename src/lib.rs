@@ -5,6 +5,8 @@ mod semantic;
 mod spec_runner;
 #[cfg(test)]
 mod analyzer_test;
+#[cfg(test)]
+mod tags_test;
 
 use zed_extension_api::{self as zed, Result};
 

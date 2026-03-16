@@ -33,7 +33,7 @@
 (alias
   name: (_) @name) @definition.type
 
-; Instance variable definitions (assignments)
+; Instance variable definitions (assignments and type declarations)
 
 (assign
   lhs: (instance_var) @name) @definition.field
@@ -41,13 +41,19 @@
 (op_assign
   lhs: (instance_var) @name) @definition.field
 
-; Class variable definitions (assignments)
+(type_declaration
+  var: (instance_var) @name) @definition.field
+
+; Class variable definitions (assignments and type declarations)
 
 (assign
   lhs: (class_var) @name) @definition.field
 
 (op_assign
   lhs: (class_var) @name) @definition.field
+
+(type_declaration
+  var: (class_var) @name) @definition.field
 
 ; Property/getter/setter macro definitions — typed form: `property name : String`
 
@@ -56,7 +62,7 @@
   arguments: (argument_list
     (type_declaration
       var: (identifier) @name))
-  (#match? @_macro_name "^(property|getter|setter|class_property|class_getter|class_setter)$")) @definition.method
+  (#match? @_macro_name "^(property|getter|setter|class_property|class_getter|class_setter)[?!]?$")) @definition.method
 
 ; Property/getter/setter macro definitions — untyped form: `getter name`
 
@@ -64,7 +70,7 @@
   method: (identifier) @_macro_name
   arguments: (argument_list
     . (identifier) @name)
-  (#match? @_macro_name "^(property|getter|setter|class_property|class_getter|class_setter)$")) @definition.method
+  (#match? @_macro_name "^(property|getter|setter|class_property|class_getter|class_setter)[?!]?$")) @definition.method
 
 ; Property/getter/setter macro definitions — symbol form: `getter :name`
 
@@ -72,7 +78,7 @@
   method: (identifier) @_macro_name
   arguments: (argument_list
     . (symbol) @name)
-  (#match? @_macro_name "^(property|getter|setter|class_property|class_getter|class_setter)$")) @definition.method
+  (#match? @_macro_name "^(property|getter|setter|class_property|class_getter|class_setter)[?!]?$")) @definition.method
 
 ; References
 
