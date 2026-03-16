@@ -1,0 +1,250 @@
+{
+  "def": {
+    "prefix": "def",
+    "body": [
+      "def ${1:method_name}${2:(${3:args})}",
+      "  $0",
+      "end"
+    ],
+    "description": "Method definition"
+  },
+  "class": {
+    "prefix": "class",
+    "body": [
+      "class ${1:ClassName}",
+      "  $0",
+      "end"
+    ],
+    "description": "Class definition"
+  },
+  "struct": {
+    "prefix": "struct",
+    "body": [
+      "struct ${1:StructName}",
+      "  $0",
+      "end"
+    ],
+    "description": "Struct definition"
+  },
+  "module": {
+    "prefix": "module",
+    "body": [
+      "module ${1:ModuleName}",
+      "  $0",
+      "end"
+    ],
+    "description": "Module definition"
+  },
+  "enum": {
+    "prefix": "enum",
+    "body": [
+      "enum ${1:EnumName}",
+      "  $2",
+      "end"
+    ],
+    "description": "Enum definition"
+  },
+  "initialize": {
+    "prefix": "init",
+    "body": [
+      "def initialize(${1:args})",
+      "  $0",
+      "end"
+    ],
+    "description": "Initialize method"
+  },
+  "require": {
+    "prefix": "req",
+    "body": "require \"$1\"",
+    "description": "Require a library"
+  },
+  "include": {
+    "prefix": "inc",
+    "body": "include ${1:ModuleName}",
+    "description": "Include a module"
+  },
+  "extend": {
+    "prefix": "ext",
+    "body": "extend ${1:ModuleName}",
+    "description": "Extend a module"
+  },
+  "property": {
+    "prefix": "prop",
+    "body": "property ${1:name} : ${2:Type}",
+    "description": "Property definition"
+  },
+  "getter": {
+    "prefix": "get",
+    "body": "getter ${1:name} : ${2:Type}",
+    "description": "Getter definition"
+  },
+  "setter": {
+    "prefix": "set",
+    "body": "setter ${1:name} : ${2:Type}",
+    "description": "Setter definition"
+  },
+  "if": {
+    "prefix": "if",
+    "body": [
+      "if ${1:condition}",
+      "  $0",
+      "end"
+    ],
+    "description": "If statement"
+  },
+  "unless": {
+    "prefix": "unl",
+    "body": [
+      "unless ${1:condition}",
+      "  $0",
+      "end"
+    ],
+    "description": "Unless statement"
+  },
+  "while": {
+    "prefix": "while",
+    "body": [
+      "while ${1:condition}",
+      "  $0",
+      "end"
+    ],
+    "description": "While loop"
+  },
+  "until": {
+    "prefix": "until",
+    "body": [
+      "until ${1:condition}",
+      "  $0",
+      "end"
+    ],
+    "description": "Until loop"
+  },
+  "loop": {
+    "prefix": "loop",
+    "body": [
+      "loop do",
+      "  $0",
+      "end"
+    ],
+    "description": "Infinite loop"
+  },
+  "case": {
+    "prefix": "case",
+    "body": [
+      "case ${1:expression}",
+      "when ${2:value}",
+      "  $0",
+      "end"
+    ],
+    "description": "Case statement"
+  },
+  "begin": {
+    "prefix": "begin",
+    "body": [
+      "begin",
+      "  $1",
+      "rescue ${2:ex}",
+      "  $0",
+      "end"
+    ],
+    "description": "Begin/Rescue block"
+  },
+  "rescue": {
+    "prefix": "res",
+    "body": [
+      "rescue ${1:ex : ${2:Exception}}",
+      "  $0"
+    ],
+    "description": "Rescue block"
+  },
+  "ensure": {
+    "prefix": "ens",
+    "body": [
+      "ensure",
+      "  $0"
+    ],
+    "description": "Ensure block"
+  },
+  "do": {
+    "prefix": "do",
+    "body": [
+      "do",
+      "  $0",
+      "end"
+    ],
+    "description": "Do block"
+  },
+  "dov": {
+    "prefix": "dov",
+    "body": [
+      "do |${1:v}|",
+      "  $0",
+      "end"
+    ],
+    "description": "Do block with variables"
+  },
+  "macro": {
+    "prefix": "macro",
+    "body": [
+      "macro ${1:name}(${2:args})",
+      "  $0",
+      "end"
+    ],
+    "description": "Macro definition"
+  },
+  "spawn": {
+    "prefix": "spawn",
+    "body": [
+      "spawn do",
+      "  $0",
+      "end"
+    ],
+    "description": "Spawn a fiber"
+  },
+  "describe": {
+    "prefix": "desc",
+    "body": [
+      "describe \"${1:description}\" do",
+      "  $0",
+      "end"
+    ],
+    "description": "Spec describe block"
+  },
+  "context": {
+    "prefix": "context",
+    "body": [
+      "context \"${1:description}\" do",
+      "  $0",
+      "end"
+    ],
+    "description": "Spec context block"
+  },
+  "it": {
+    "prefix": "it",
+    "body": [
+      "it \"${1:description}\" do",
+      "  $0",
+      "end"
+    ],
+    "description": "Spec it block"
+  },
+  "record": {
+    "prefix": "rec",
+    "body": "record ${1:RecordName}, ${2:fields} $0",
+    "description": "Record definition"
+  },
+  "alias": {
+    "prefix": "alias",
+    "body": "alias ${1:AliasName} = ${2:Type}",
+    "description": "Alias definition"
+  },
+  "lib": {
+    "prefix": "lib",
+    "body": [
+      "lib ${1:LibName}",
+      "  $0",
+      "end"
+    ],
+    "description": "Lib definition (C bindings)"
+  }
+}
