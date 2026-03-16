@@ -1,0 +1,7 @@
+[
+  {
+    "label": "crystal spec",
+    "command": "crystal spec $ZED_FILE:$ZED_ROW",
+    "tags": ["crystal-spec"]
+  }
+]
