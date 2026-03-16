@@ -1,0 +1,7 @@
+id = "crystallized"
+name = "CrystalliZed"
+version = "0.0.1"
+schema_version = 1
+authors = ["Bob"]
+description = "Crystal language support for Zed"
+repository = "https://github.com/nook/zed-crystal"
