@@ -6,6 +6,10 @@ authors = ["Bob"]
 description = "Crystal language support for Zed"
 repository = "https://github.com/nook/zed-crystal"
 
+[slash_commands.crystal-expand]
+description = "Expand Crystal macros using `crystal tool expand`"
+requires_argument = true
+
 [grammars.crystal]
 repository = "https://github.com/crystal-lang-tools/tree-sitter-crystal"
 commit = "50ca9e6fcfb16a2cbcad59203cfd8ad650e25c49"
