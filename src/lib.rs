@@ -1,5 +1,10 @@
+mod analyzer;
+#[cfg(test)]
+mod analyzer_test;
+
 use std::fs;
 use zed_extension_api::{self as zed, Result};
+use analyzer::Analyzer;
 
 struct CrystalliZedExtension {
     cached_binary_path: Option<String>,
