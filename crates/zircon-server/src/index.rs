@@ -130,9 +130,27 @@ impl DocumentIndex {
         results
     }
 
+    /// Search all indexed files for any definition matching `name` (any kind).
+    pub fn find_by_name(&self, name: &str) -> Vec<(&Path, &Symbol)> {
+        let mut results = Vec::new();
+        for (path, symbols) in &self.files {
+            for sym in symbols {
+                if sym.name == name {
+                    results.push((path.as_path(), sym));
+                }
+            }
+        }
+        results
+    }
+
     /// Return all symbols for a given file.
     pub fn symbols_for_file(&self, path: &Path) -> Option<&Vec<Symbol>> {
         self.files.get(path)
+    }
+
+    /// Return all indexed file paths.
+    pub fn indexed_paths(&self) -> Vec<&Path> {
+        self.files.keys().map(|p| p.as_path()).collect()
     }
 
     /// Extract symbols from Crystal source code using the tags query.
