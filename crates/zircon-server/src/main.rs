@@ -1,5 +1,6 @@
 mod completion;
 mod definition;
+mod diagnostics;
 mod hover;
 mod index;
 mod resolver;
@@ -11,19 +12,23 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use log::info;
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
     CompletionOptions, CompletionParams, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, DocumentSymbolParams, GotoDefinitionParams, HoverParams,
-    InitializeParams, OneOf, ServerCapabilities, TextDocumentSyncCapability,
-    TextDocumentSyncKind, WorkDoneProgressOptions, WorkspaceSymbolParams,
+    InitializeParams, OneOf, PublishDiagnosticsParams, ServerCapabilities,
+    TextDocumentSyncCapability, TextDocumentSyncKind, WorkDoneProgressOptions,
+    WorkspaceSymbolParams,
 };
 use tree_sitter::Parser;
 
 use crate::index::DocumentIndex;
 use crate::workspace::Workspace;
+
+const DIAGNOSTICS_DEBOUNCE: Duration = Duration::from_millis(150);
 
 /// Holds all server state across requests.
 struct ServerState {
@@ -34,6 +39,8 @@ struct ServerState {
     parser: Parser,
     /// Workspace root path.
     _root: Option<PathBuf>,
+    /// Paths needing diagnostic re-publish, mapped to when the change occurred.
+    pending_diagnostics: HashMap<PathBuf, Instant>,
 }
 
 impl ServerState {
@@ -49,6 +56,7 @@ impl ServerState {
             open_docs: HashMap::new(),
             parser,
             _root: root.clone(),
+            pending_diagnostics: HashMap::new(),
         };
 
         // Scan workspace and index all Crystal files.
@@ -68,6 +76,19 @@ impl ServerState {
             return Some(src.clone());
         }
         fs::read_to_string(path).ok()
+    }
+
+    /// Schedule a diagnostic update for a file (debounced).
+    fn schedule_diagnostics(&mut self, path: PathBuf) {
+        self.pending_diagnostics.insert(path, Instant::now());
+    }
+
+    /// Return the earliest deadline at which pending diagnostics should fire.
+    fn next_diagnostic_deadline(&self) -> Option<Instant> {
+        self.pending_diagnostics
+            .values()
+            .min()
+            .map(|t| *t + DIAGNOSTICS_DEBOUNCE)
     }
 }
 
@@ -122,7 +143,23 @@ fn main_loop(
     connection: &Connection,
     state: &mut ServerState,
 ) -> Result<(), Box<dyn Error + Sync + Send>> {
-    for msg in &connection.receiver {
+    loop {
+        let msg = if let Some(deadline) = state.next_diagnostic_deadline() {
+            match connection.receiver.recv_deadline(deadline) {
+                Ok(msg) => msg,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    publish_pending_diagnostics(connection, state)?;
+                    continue;
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return Ok(()),
+            }
+        } else {
+            match connection.receiver.recv() {
+                Ok(msg) => msg,
+                Err(_) => return Ok(()),
+            }
+        };
+
         match msg {
             Message::Request(req) => {
                 if connection.handle_shutdown(&req)? {
@@ -131,12 +168,11 @@ fn main_loop(
                 handle_request(connection, state, req)?;
             }
             Message::Notification(notif) => {
-                handle_notification(state, notif)?;
+                handle_notification(connection, state, notif)?;
             }
             Message::Response(_resp) => {}
         }
     }
-    Ok(())
 }
 
 fn handle_request(
@@ -213,6 +249,7 @@ fn handle_request(
 }
 
 fn handle_notification(
+    connection: &Connection,
     state: &mut ServerState,
     notif: Notification,
 ) -> Result<(), Box<dyn Error + Sync + Send>> {
@@ -222,16 +259,17 @@ fn handle_notification(
             if let Some(path) = uri::to_path(&params.text_document.uri) {
                 let source = params.text_document.text;
                 state.index.update_file(&path, &source);
-                state.open_docs.insert(path, source);
+                state.open_docs.insert(path.clone(), source);
+                state.schedule_diagnostics(path);
             }
         }
         "textDocument/didChange" => {
             let params: DidChangeTextDocumentParams = serde_json::from_value(notif.params)?;
             if let Some(path) = uri::to_path(&params.text_document.uri) {
-                // With FULL sync, the last content change is the full text.
                 if let Some(change) = params.content_changes.into_iter().last() {
                     state.index.update_file(&path, &change.text);
-                    state.open_docs.insert(path, change.text);
+                    state.open_docs.insert(path.clone(), change.text);
+                    state.schedule_diagnostics(path);
                 }
             }
         }
@@ -239,8 +277,13 @@ fn handle_notification(
             let params: DidCloseTextDocumentParams = serde_json::from_value(notif.params)?;
             if let Some(path) = uri::to_path(&params.text_document.uri) {
                 state.open_docs.remove(&path);
+                state.pending_diagnostics.remove(&path);
                 // Re-index from disk so the file stays in the index.
                 state.index.index_file(&path);
+                // Clear diagnostics for the closed file.
+                if let Some(u) = uri::from_path(&path) {
+                    send_diagnostics(connection, u, vec![])?;
+                }
             }
         }
         "textDocument/didSave" => {
@@ -253,6 +296,50 @@ fn handle_notification(
             info!("unhandled notification: {}", notif.method);
         }
     }
+    Ok(())
+}
+
+fn publish_pending_diagnostics(
+    connection: &Connection,
+    state: &mut ServerState,
+) -> Result<(), Box<dyn Error + Sync + Send>> {
+    let now = Instant::now();
+    let ready: Vec<PathBuf> = state
+        .pending_diagnostics
+        .iter()
+        .filter(|(_, time)| now >= **time + DIAGNOSTICS_DEBOUNCE)
+        .map(|(path, _)| path.clone())
+        .collect();
+
+    for path in ready {
+        state.pending_diagnostics.remove(&path);
+        let source = state.get_source(&path);
+        let diags = match source {
+            Some(src) => diagnostics::extract_syntax_errors(&mut state.parser, &src),
+            None => Vec::new(),
+        };
+        if let Some(u) = uri::from_path(&path) {
+            send_diagnostics(connection, u, diags)?;
+        }
+    }
+    Ok(())
+}
+
+fn send_diagnostics(
+    connection: &Connection,
+    uri: lsp_types::Uri,
+    diagnostics: Vec<lsp_types::Diagnostic>,
+) -> Result<(), Box<dyn Error + Sync + Send>> {
+    let params = PublishDiagnosticsParams {
+        uri,
+        diagnostics,
+        version: None,
+    };
+    let notif = lsp_server::Notification::new(
+        "textDocument/publishDiagnostics".to_string(),
+        params,
+    );
+    connection.sender.send(Message::Notification(notif))?;
     Ok(())
 }
 
