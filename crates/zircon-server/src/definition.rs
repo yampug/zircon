@@ -74,7 +74,7 @@ pub fn handle(
 
 /// Classify a tree-sitter node to determine the symbol name and which
 /// `SymbolKind`s to search for.
-fn classify_node(
+pub fn classify_node(
     node: tree_sitter::Node,
     source: &str,
 ) -> Option<(String, Vec<SymbolKind>)> {

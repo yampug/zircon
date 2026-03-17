@@ -1,4 +1,5 @@
 mod definition;
+mod hover;
 mod index;
 mod resolver;
 mod uri;
@@ -13,8 +14,8 @@ use log::info;
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
     CompletionOptions, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, GotoDefinitionParams, InitializeParams, OneOf, ServerCapabilities,
-    TextDocumentSyncCapability, TextDocumentSyncKind, WorkDoneProgressOptions,
+    DidOpenTextDocumentParams, GotoDefinitionParams, HoverParams, InitializeParams, OneOf,
+    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, WorkDoneProgressOptions,
 };
 use tree_sitter::Parser;
 
@@ -160,7 +161,18 @@ fn handle_request(
             connection.sender.send(Message::Response(resp))?;
         }
         "textDocument/hover" => {
-            send_null_response(connection, id)?;
+            let params: HoverParams = serde_json::from_value(req.params)?;
+            let source = params
+                .text_document_position_params
+                .text_document
+                .uri
+                .as_str()
+                .strip_prefix("file://")
+                .and_then(|p| state.get_source(Path::new(p)));
+            let result =
+                hover::handle(&state.index, &mut state.parser, params, source.as_deref());
+            let resp = Response::new_ok(id, result);
+            connection.sender.send(Message::Response(resp))?;
         }
         "textDocument/completion" => {
             send_empty_response(connection, id)?;
