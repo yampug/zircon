@@ -23,6 +23,13 @@ requires_argument = true
 description = "Run Crystal specs and show inline failure annotations with expected/actual diffs"
 requires_argument = false
 
+[language_servers.zircon]
+name = "Zircon"
+languages = ["Crystal"]
+
+[language_servers.zircon.language_ids]
+Crystal = "crystal"
+
 [grammars.crystal]
 repository = "https://github.com/crystal-lang-tools/tree-sitter-crystal"
 commit = "50ca9e6fcfb16a2cbcad59203cfd8ad650e25c49"

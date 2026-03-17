@@ -1,6 +1,5 @@
 #[cfg(test)]
 mod analyzer;
-#[allow(dead_code)]
 mod semantic;
 mod spec_runner;
 #[cfg(test)]
@@ -107,6 +106,89 @@ impl zed::Extension for ZirconExtension {
         Self {
             binary_manager: ServerBinaryManager::new(),
         }
+    }
+
+    fn language_server_command(
+        &mut self,
+        language_server_id: &zed::LanguageServerId,
+        worktree: &zed::Worktree,
+    ) -> Result<zed::Command> {
+        // Check PATH first (Story 5.4 fallback).
+        if let Some(path) = worktree.which("zircon-server") {
+            return Ok(zed::Command {
+                command: path,
+                args: vec![],
+                env: worktree.shell_env(),
+            });
+        }
+
+        let binary_path = self.binary_manager.server_binary_path(language_server_id)?;
+        Ok(zed::Command {
+            command: binary_path,
+            args: vec![],
+            env: worktree.shell_env(),
+        })
+    }
+
+    fn language_server_initialization_options(
+        &mut self,
+        _language_server_id: &zed::LanguageServerId,
+        worktree: &zed::Worktree,
+    ) -> Result<Option<serde_json::Value>> {
+        let root = worktree.root_path();
+        let mut crystal_project_roots = vec![];
+        if worktree.read_text_file("shard.yml").is_ok() {
+            crystal_project_roots.push(&root);
+        }
+        Ok(Some(serde_json::json!({
+            "workspaceRoot": root,
+            "crystalProjectRoots": crystal_project_roots,
+        })))
+    }
+
+    fn label_for_completion(
+        &self,
+        _language_server_id: &zed::LanguageServerId,
+        completion: zed::lsp::Completion,
+    ) -> Option<zed::CodeLabel> {
+        let kind = completion.kind.as_ref()?;
+        let highlight = semantic::highlight_for_completion_kind(kind);
+        let filter_end = completion.label.len() as u32;
+
+        let mut spans = vec![
+            zed::CodeLabelSpan::literal(&completion.label, Some(highlight.to_string())),
+        ];
+
+        if let Some(ref detail) = completion.detail {
+            spans.push(zed::CodeLabelSpan::literal(" : ", None));
+            spans.push(zed::CodeLabelSpan::literal(
+                detail,
+                Some(semantic::highlight_for_type(detail).to_string()),
+            ));
+        }
+
+        Some(zed::CodeLabel {
+            code: completion.label.clone(),
+            spans,
+            filter_range: (0..filter_end).into(),
+        })
+    }
+
+    fn label_for_symbol(
+        &self,
+        _language_server_id: &zed::LanguageServerId,
+        symbol: zed::lsp::Symbol,
+    ) -> Option<zed::CodeLabel> {
+        let highlight = semantic::highlight_for_symbol_kind(&symbol.kind);
+        let filter_end = symbol.name.len() as u32;
+
+        Some(zed::CodeLabel {
+            code: symbol.name.clone(),
+            spans: vec![
+                zed::CodeLabelSpan::literal(&symbol.name, Some(highlight.to_string())),
+            ],
+            filter_range: (0..filter_end).into(),
+        })
     }
 
     fn run_slash_command(
