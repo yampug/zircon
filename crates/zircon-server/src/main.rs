@@ -1,3 +1,4 @@
+mod completion;
 mod definition;
 mod hover;
 mod index;
@@ -13,7 +14,7 @@ use std::path::{Path, PathBuf};
 use log::info;
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
-    CompletionOptions, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
+    CompletionOptions, CompletionParams, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
     DidOpenTextDocumentParams, GotoDefinitionParams, HoverParams, InitializeParams, OneOf,
     ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, WorkDoneProgressOptions,
 };
@@ -175,7 +176,18 @@ fn handle_request(
             connection.sender.send(Message::Response(resp))?;
         }
         "textDocument/completion" => {
-            send_empty_response(connection, id)?;
+            let params: CompletionParams = serde_json::from_value(req.params)?;
+            let source = params
+                .text_document_position
+                .text_document
+                .uri
+                .as_str()
+                .strip_prefix("file://")
+                .and_then(|p| state.get_source(Path::new(p)));
+            let result =
+                completion::handle(&state.index, params, source.as_deref());
+            let resp = Response::new_ok(id, result);
+            connection.sender.send(Message::Response(resp))?;
         }
         "textDocument/documentSymbol" => {
             send_empty_response(connection, id)?;

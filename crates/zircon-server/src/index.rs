@@ -153,6 +153,30 @@ impl DocumentIndex {
         self.files.keys().map(|p| p.as_path()).collect()
     }
 
+    /// Find all symbols whose parent matches `parent_name`.
+    pub fn find_by_parent(&self, parent_name: &str) -> Vec<(&Path, &Symbol)> {
+        let mut results = Vec::new();
+        for (path, symbols) in &self.files {
+            for sym in symbols {
+                if sym.parent.as_deref() == Some(parent_name) {
+                    results.push((path.as_path(), sym));
+                }
+            }
+        }
+        results
+    }
+
+    /// Return all definition symbols across all indexed files.
+    pub fn all_symbols(&self) -> Vec<(&Path, &Symbol)> {
+        let mut results = Vec::new();
+        for (path, symbols) in &self.files {
+            for sym in symbols {
+                results.push((path.as_path(), sym));
+            }
+        }
+        results
+    }
+
     /// Extract symbols from Crystal source code using the tags query.
     fn extract_symbols(&mut self, source: &str) -> Vec<Symbol> {
         let tree = match self.parser.parse(source, None) {
