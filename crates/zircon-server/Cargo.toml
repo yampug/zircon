@@ -1,0 +1,17 @@
+[package]
+name = "zircon-server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "zircon-server"
+path = "src/main.rs"
+
+[dependencies]
+lsp-server = "0.7"
+lsp-types = "0.97"
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+crossbeam-channel = "0.5"
+log = "0.4"
+env_logger = "0.11"
