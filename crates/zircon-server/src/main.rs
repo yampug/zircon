@@ -1,4 +1,5 @@
 mod index;
+mod resolver;
 mod workspace;
 
 use std::error::Error;
