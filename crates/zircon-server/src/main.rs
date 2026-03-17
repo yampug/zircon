@@ -1,3 +1,5 @@
+mod workspace;
+
 use std::error::Error;
 
 use log::info;
