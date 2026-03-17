@@ -26,6 +26,7 @@ use lsp_types::{
 };
 use tree_sitter::Parser;
 
+use crate::diagnostics::DiagnosticStore;
 use crate::index::DocumentIndex;
 use crate::workspace::Workspace;
 
@@ -42,6 +43,8 @@ struct ServerState {
     _root: Option<PathBuf>,
     /// Paths needing diagnostic re-publish, mapped to when the change occurred.
     pending_diagnostics: HashMap<PathBuf, Instant>,
+    /// Merged diagnostic store (syntax + compiler).
+    diagnostic_store: DiagnosticStore,
 }
 
 impl ServerState {
@@ -58,6 +61,7 @@ impl ServerState {
             parser,
             _root: root.clone(),
             pending_diagnostics: HashMap::new(),
+            diagnostic_store: DiagnosticStore::new(),
         };
 
         // Scan workspace and index all Crystal files.
@@ -288,6 +292,7 @@ fn handle_notification(
             if let Some(path) = uri::to_path(&params.text_document.uri) {
                 state.open_docs.remove(&path);
                 state.pending_diagnostics.remove(&path);
+                state.diagnostic_store.clear(&path);
                 // Re-index from disk so the file stays in the index.
                 state.index.index_file(&path);
                 // Clear diagnostics for the closed file.
@@ -302,10 +307,11 @@ fn handle_notification(
                 info!("document saved: {:?}", path);
                 // Run Crystal compiler diagnostics in the foreground.
                 // This blocks the main loop but the 30s timeout prevents hangs.
-                if let Some(compiler_diags) = crystal_cli::check_file(&path) {
-                    if let Some(u) = uri::from_path(&path) {
-                        send_diagnostics(connection, u, compiler_diags)?;
-                    }
+                let compiler_diags = crystal_cli::check_file(&path).unwrap_or_default();
+                state.diagnostic_store.set_compiler(&path, compiler_diags);
+                if let Some(u) = uri::from_path(&path) {
+                    let merged = state.diagnostic_store.merged(&path);
+                    send_diagnostics(connection, u, merged)?;
                 }
             }
         }
@@ -334,12 +340,14 @@ fn publish_pending_diagnostics(
     for path in ready {
         state.pending_diagnostics.remove(&path);
         let source = state.get_source(&path);
-        let diags = match source {
+        let syntax_diags = match source {
             Some(src) => diagnostics::extract_syntax_errors(&mut state.parser, &src),
             None => Vec::new(),
         };
+        state.diagnostic_store.set_syntax(&path, syntax_diags);
         if let Some(u) = uri::from_path(&path) {
-            send_diagnostics(connection, u, diags)?;
+            let merged = state.diagnostic_store.merged(&path);
+            send_diagnostics(connection, u, merged)?;
         }
     }
     Ok(())

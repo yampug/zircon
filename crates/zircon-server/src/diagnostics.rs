@@ -1,8 +1,82 @@
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
 use lsp_types::{Diagnostic, DiagnosticSeverity, Position, Range};
 use tree_sitter::{Node, Parser};
 
+use crate::crystal_cli;
+
 /// Source label for tree-sitter syntax diagnostics.
 pub const SOURCE_SYNTAX: &str = "zircon-syntax";
+
+/// Stores syntax and compiler diagnostics per file, merging them for publishing.
+pub struct DiagnosticStore {
+    syntax: HashMap<PathBuf, Vec<Diagnostic>>,
+    compiler: HashMap<PathBuf, Vec<Diagnostic>>,
+}
+
+impl DiagnosticStore {
+    pub fn new() -> Self {
+        DiagnosticStore {
+            syntax: HashMap::new(),
+            compiler: HashMap::new(),
+        }
+    }
+
+    /// Update the syntax (tree-sitter) diagnostics for a file.
+    pub fn set_syntax(&mut self, path: &Path, diags: Vec<Diagnostic>) {
+        self.syntax.insert(path.to_path_buf(), diags);
+    }
+
+    /// Update the compiler diagnostics for a file.
+    pub fn set_compiler(&mut self, path: &Path, diags: Vec<Diagnostic>) {
+        self.compiler.insert(path.to_path_buf(), diags);
+    }
+
+    /// Clear all diagnostics for a file.
+    pub fn clear(&mut self, path: &Path) {
+        self.syntax.remove(path);
+        self.compiler.remove(path);
+    }
+
+    /// Return the merged, deduplicated diagnostics for a file.
+    ///
+    /// When a compiler diagnostic and a syntax diagnostic overlap on the same
+    /// line, the compiler diagnostic is kept (it is more specific) and the
+    /// syntax diagnostic is dropped.
+    pub fn merged(&self, path: &Path) -> Vec<Diagnostic> {
+        let syntax = self.syntax.get(path);
+        let compiler = self.compiler.get(path);
+
+        match (syntax, compiler) {
+            (None, None) => Vec::new(),
+            (Some(s), None) => s.clone(),
+            (None, Some(c)) => c.clone(),
+            (Some(s), Some(c)) => merge_diagnostics(s, c),
+        }
+    }
+}
+
+/// Merge syntax and compiler diagnostics, deduplicating by line.
+/// Compiler diagnostics take precedence over syntax diagnostics on the same line.
+fn merge_diagnostics(syntax: &[Diagnostic], compiler: &[Diagnostic]) -> Vec<Diagnostic> {
+    // Collect the set of lines that have compiler diagnostics.
+    let compiler_lines: std::collections::HashSet<u32> = compiler
+        .iter()
+        .map(|d| d.range.start.line)
+        .collect();
+
+    let mut result: Vec<Diagnostic> = compiler.to_vec();
+
+    // Add syntax diagnostics that don't overlap with compiler diagnostics.
+    for d in syntax {
+        if !compiler_lines.contains(&d.range.start.line) {
+            result.push(d.clone());
+        }
+    }
+
+    result
+}
 
 /// Extract syntax error diagnostics from Crystal source code.
 pub fn extract_syntax_errors(parser: &mut Parser, source: &str) -> Vec<Diagnostic> {
@@ -177,5 +251,144 @@ mod tests {
         for d in &diags {
             assert_eq!(d.source.as_deref(), Some("zircon-syntax"));
         }
+    }
+
+    fn make_diag(line: u32, source: &str, message: &str) -> Diagnostic {
+        Diagnostic {
+            range: Range {
+                start: Position {
+                    line,
+                    character: 0,
+                },
+                end: Position {
+                    line,
+                    character: 5,
+                },
+            },
+            severity: Some(DiagnosticSeverity::ERROR),
+            source: Some(source.to_string()),
+            message: message.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_store_syntax_only() {
+        let mut store = DiagnosticStore::new();
+        let path = Path::new("test.cr");
+        let diags = vec![make_diag(0, SOURCE_SYNTAX, "syntax err")];
+        store.set_syntax(path, diags);
+
+        let merged = store.merged(path);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].source.as_deref(), Some(SOURCE_SYNTAX));
+    }
+
+    #[test]
+    fn test_store_compiler_only() {
+        let mut store = DiagnosticStore::new();
+        let path = Path::new("test.cr");
+        let diags = vec![make_diag(0, crystal_cli::SOURCE_COMPILER, "type err")];
+        store.set_compiler(path, diags);
+
+        let merged = store.merged(path);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0].source.as_deref(),
+            Some(crystal_cli::SOURCE_COMPILER)
+        );
+    }
+
+    #[test]
+    fn test_store_dedup_same_line_prefers_compiler() {
+        let mut store = DiagnosticStore::new();
+        let path = Path::new("test.cr");
+        store.set_syntax(
+            path,
+            vec![make_diag(5, SOURCE_SYNTAX, "unexpected token")],
+        );
+        store.set_compiler(
+            path,
+            vec![make_diag(5, crystal_cli::SOURCE_COMPILER, "undefined method 'foo'")],
+        );
+
+        let merged = store.merged(path);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].message, "undefined method 'foo'");
+        assert_eq!(
+            merged[0].source.as_deref(),
+            Some(crystal_cli::SOURCE_COMPILER)
+        );
+    }
+
+    #[test]
+    fn test_store_different_lines_kept() {
+        let mut store = DiagnosticStore::new();
+        let path = Path::new("test.cr");
+        store.set_syntax(
+            path,
+            vec![make_diag(1, SOURCE_SYNTAX, "syntax err")],
+        );
+        store.set_compiler(
+            path,
+            vec![make_diag(5, crystal_cli::SOURCE_COMPILER, "type err")],
+        );
+
+        let merged = store.merged(path);
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn test_store_clear_removes_both() {
+        let mut store = DiagnosticStore::new();
+        let path = Path::new("test.cr");
+        store.set_syntax(path, vec![make_diag(0, SOURCE_SYNTAX, "a")]);
+        store.set_compiler(
+            path,
+            vec![make_diag(1, crystal_cli::SOURCE_COMPILER, "b")],
+        );
+
+        store.clear(path);
+        let merged = store.merged(path);
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn test_store_update_syntax_preserves_compiler() {
+        let mut store = DiagnosticStore::new();
+        let path = Path::new("test.cr");
+        store.set_compiler(
+            path,
+            vec![make_diag(3, crystal_cli::SOURCE_COMPILER, "type err")],
+        );
+        // Syntax errors change but compiler stays.
+        store.set_syntax(path, vec![]);
+
+        let merged = store.merged(path);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].message, "type err");
+    }
+
+    #[test]
+    fn test_store_update_compiler_preserves_syntax() {
+        let mut store = DiagnosticStore::new();
+        let path = Path::new("test.cr");
+        store.set_syntax(
+            path,
+            vec![make_diag(0, SOURCE_SYNTAX, "syntax err")],
+        );
+        // Compiler clears but syntax stays.
+        store.set_compiler(path, vec![]);
+
+        let merged = store.merged(path);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].message, "syntax err");
+    }
+
+    #[test]
+    fn test_store_empty_file() {
+        let store = DiagnosticStore::new();
+        let merged = store.merged(Path::new("unknown.cr"));
+        assert!(merged.is_empty());
     }
 }
