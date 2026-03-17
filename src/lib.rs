@@ -10,11 +10,103 @@ mod tags_test;
 
 use zed_extension_api::{self as zed, Result};
 
-struct ZirconExtension;
+/// Manages downloading, caching, and versioning of the zircon-server binary.
+struct ServerBinaryManager {
+    cached_binary_path: Option<String>,
+}
+
+impl ServerBinaryManager {
+    fn new() -> Self {
+        Self {
+            cached_binary_path: None,
+        }
+    }
+
+    /// Return the path to a cached zircon-server binary, downloading it if needed.
+    fn server_binary_path(
+        &mut self,
+        language_server_id: &zed::LanguageServerId,
+    ) -> Result<String, String> {
+        // Return in-memory cached path if the file still exists on disk.
+        if let Some(ref path) = self.cached_binary_path {
+            if std::fs::metadata(path).is_ok() {
+                return Ok(path.clone());
+            }
+        }
+
+        zed::set_language_server_installation_status(
+            language_server_id,
+            &zed::LanguageServerInstallationStatus::CheckingForUpdate,
+        );
+
+        let release = zed::latest_github_release(
+            "yampug/zircon",
+            zed::GithubReleaseOptions {
+                require_assets: true,
+                pre_release: false,
+            },
+        )?;
+
+        let version = &release.version;
+        let binary_path = format!("zircon-server-{version}/zircon-server");
+
+        // Already have this version on disk — reuse it.
+        if std::fs::metadata(&binary_path).is_ok() {
+            self.cached_binary_path = Some(binary_path.clone());
+            return Ok(binary_path);
+        }
+
+        // Pick the platform-appropriate gzipped asset.
+        let (os, arch) = zed::current_platform();
+        let asset_name = match (os, arch) {
+            (zed::Os::Mac, zed::Architecture::Aarch64) => {
+                "zircon-server_arm64-apple-darwin.gz"
+            }
+            (zed::Os::Mac, zed::Architecture::X8664) => {
+                "zircon-server_x86_64-apple-darwin.gz"
+            }
+            (zed::Os::Linux, zed::Architecture::X8664) => {
+                "zircon-server_x86_64-unknown-linux-musl.gz"
+            }
+            (zed::Os::Linux, zed::Architecture::Aarch64) => {
+                "zircon-server_arm64-unknown-linux-musl.gz"
+            }
+            _ => return Err("unsupported platform for zircon-server".to_string()),
+        };
+
+        let asset = release
+            .assets
+            .iter()
+            .find(|a| a.name == asset_name)
+            .ok_or_else(|| format!("no release asset found: {asset_name}"))?;
+
+        zed::set_language_server_installation_status(
+            language_server_id,
+            &zed::LanguageServerInstallationStatus::Downloading,
+        );
+
+        zed::download_file(
+            &asset.download_url,
+            &binary_path,
+            zed::DownloadedFileType::Gzip,
+        )?;
+
+        zed::make_file_executable(&binary_path)?;
+
+        self.cached_binary_path = Some(binary_path.clone());
+        Ok(binary_path)
+    }
+}
+
+struct ZirconExtension {
+    binary_manager: ServerBinaryManager,
+}
 
 impl zed::Extension for ZirconExtension {
     fn new() -> Self {
-        Self
+        Self {
+            binary_manager: ServerBinaryManager::new(),
+        }
     }
 
     fn run_slash_command(
