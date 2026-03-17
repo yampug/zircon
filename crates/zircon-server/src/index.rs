@@ -50,10 +50,16 @@ pub struct Symbol {
     pub name: String,
     pub kind: SymbolKind,
     pub byte_range: Range<usize>,
+    /// Name (selection) range.
     pub start_line: usize,
     pub start_col: usize,
     pub end_line: usize,
     pub end_col: usize,
+    /// Full definition range (e.g., from `class` keyword to `end`).
+    pub def_start_line: usize,
+    pub def_start_col: usize,
+    pub def_end_line: usize,
+    pub def_end_col: usize,
     /// Enclosing class/module/struct name, if any.
     pub parent: Option<String>,
 }
@@ -227,6 +233,8 @@ impl DocumentIndex {
             let node = name_cap.node;
             let start = node.start_position();
             let end = node.end_position();
+            let def_start = def_node.start_position();
+            let def_end = def_node.end_position();
 
             // Walk up from the *definition node's parent* to find the
             // enclosing scope (skipping the definition node itself).
@@ -240,6 +248,10 @@ impl DocumentIndex {
                 start_col: start.column,
                 end_line: end.row,
                 end_col: end.column,
+                def_start_line: def_start.row,
+                def_start_col: def_start.column,
+                def_end_line: def_end.row,
+                def_end_col: def_end.column,
                 parent,
             });
         }

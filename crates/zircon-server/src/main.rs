@@ -3,6 +3,7 @@ mod definition;
 mod hover;
 mod index;
 mod resolver;
+mod symbols;
 mod uri;
 mod workspace;
 
@@ -15,8 +16,9 @@ use log::info;
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
     CompletionOptions, CompletionParams, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, GotoDefinitionParams, HoverParams, InitializeParams, OneOf,
-    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, WorkDoneProgressOptions,
+    DidOpenTextDocumentParams, DocumentSymbolParams, GotoDefinitionParams, HoverParams,
+    InitializeParams, OneOf, ServerCapabilities, TextDocumentSyncCapability,
+    TextDocumentSyncKind, WorkDoneProgressOptions, WorkspaceSymbolParams,
 };
 use tree_sitter::Parser;
 
@@ -190,10 +192,16 @@ fn handle_request(
             connection.sender.send(Message::Response(resp))?;
         }
         "textDocument/documentSymbol" => {
-            send_empty_response(connection, id)?;
+            let params: DocumentSymbolParams = serde_json::from_value(req.params)?;
+            let result = symbols::handle_document_symbols(&state.index, params);
+            let resp = Response::new_ok(id, result);
+            connection.sender.send(Message::Response(resp))?;
         }
         "workspace/symbol" => {
-            send_empty_response(connection, id)?;
+            let params: WorkspaceSymbolParams = serde_json::from_value(req.params)?;
+            let result = symbols::handle_workspace_symbols(&state.index, params);
+            let resp = Response::new_ok(id, result);
+            connection.sender.send(Message::Response(resp))?;
         }
         _ => {
             info!("unhandled request: {}", method);
@@ -245,15 +253,6 @@ fn handle_notification(
             info!("unhandled notification: {}", notif.method);
         }
     }
-    Ok(())
-}
-
-fn send_empty_response(
-    connection: &Connection,
-    id: RequestId,
-) -> Result<(), Box<dyn Error + Sync + Send>> {
-    let resp = Response::new_ok(id, serde_json::Value::Array(vec![]));
-    connection.sender.send(Message::Response(resp))?;
     Ok(())
 }
 
