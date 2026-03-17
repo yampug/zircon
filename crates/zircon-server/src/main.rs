@@ -1,4 +1,5 @@
 mod completion;
+mod crystal_cli;
 mod definition;
 mod diagnostics;
 mod hover;
@@ -18,10 +19,10 @@ use log::info;
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
     CompletionOptions, CompletionParams, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DocumentSymbolParams, GotoDefinitionParams, HoverParams,
-    InitializeParams, OneOf, PublishDiagnosticsParams, ServerCapabilities,
-    TextDocumentSyncCapability, TextDocumentSyncKind, WorkDoneProgressOptions,
-    WorkspaceSymbolParams,
+    DidOpenTextDocumentParams, DidSaveTextDocumentParams, DocumentSymbolParams,
+    GotoDefinitionParams, HoverParams, InitializeParams, OneOf, PublishDiagnosticsParams,
+    SaveOptions, ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind,
+    TextDocumentSyncOptions, WorkDoneProgressOptions, WorkspaceSymbolParams,
 };
 use tree_sitter::Parser;
 
@@ -120,8 +121,17 @@ fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
 
 fn capabilities() -> ServerCapabilities {
     ServerCapabilities {
-        text_document_sync: Some(TextDocumentSyncCapability::Kind(
-            TextDocumentSyncKind::FULL,
+        text_document_sync: Some(TextDocumentSyncCapability::Options(
+            TextDocumentSyncOptions {
+                open_close: Some(true),
+                change: Some(TextDocumentSyncKind::FULL),
+                save: Some(lsp_types::TextDocumentSyncSaveOptions::SaveOptions(
+                    SaveOptions {
+                        include_text: Some(false),
+                    },
+                )),
+                ..Default::default()
+            },
         )),
         definition_provider: Some(OneOf::Left(true)),
         hover_provider: Some(lsp_types::HoverProviderCapability::Simple(true)),
@@ -287,7 +297,17 @@ fn handle_notification(
             }
         }
         "textDocument/didSave" => {
-            info!("document saved");
+            let params: DidSaveTextDocumentParams = serde_json::from_value(notif.params)?;
+            if let Some(path) = uri::to_path(&params.text_document.uri) {
+                info!("document saved: {:?}", path);
+                // Run Crystal compiler diagnostics in the foreground.
+                // This blocks the main loop but the 30s timeout prevents hangs.
+                if let Some(compiler_diags) = crystal_cli::check_file(&path) {
+                    if let Some(u) = uri::from_path(&path) {
+                        send_diagnostics(connection, u, compiler_diags)?;
+                    }
+                }
+            }
         }
         "initialized" => {
             info!("client sent initialized notification");
