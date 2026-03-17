@@ -45,6 +45,10 @@ struct ServerState {
     pending_diagnostics: HashMap<PathBuf, Instant>,
     /// Merged diagnostic store (syntax + compiler).
     diagnostic_store: DiagnosticStore,
+    /// Sender for background compiler diagnostic results.
+    compiler_tx: crossbeam_channel::Sender<(PathBuf, Vec<lsp_types::Diagnostic>)>,
+    /// Receiver for background compiler diagnostic results.
+    compiler_rx: crossbeam_channel::Receiver<(PathBuf, Vec<lsp_types::Diagnostic>)>,
 }
 
 impl ServerState {
@@ -55,6 +59,8 @@ impl ServerState {
             .set_language(&lang)
             .expect("failed to load Crystal grammar");
 
+        let (compiler_tx, compiler_rx) = crossbeam_channel::unbounded();
+
         let mut state = ServerState {
             index: DocumentIndex::new(),
             open_docs: HashMap::new(),
@@ -62,6 +68,8 @@ impl ServerState {
             _root: root.clone(),
             pending_diagnostics: HashMap::new(),
             diagnostic_store: DiagnosticStore::new(),
+            compiler_tx,
+            compiler_rx,
         };
 
         // Scan workspace and index all Crystal files.
@@ -157,34 +165,49 @@ fn main_loop(
     connection: &Connection,
     state: &mut ServerState,
 ) -> Result<(), Box<dyn Error + Sync + Send>> {
+    // Clone the receiver so the select doesn't borrow state.
+    let compiler_rx = state.compiler_rx.clone();
     loop {
-        let msg = if let Some(deadline) = state.next_diagnostic_deadline() {
-            match connection.receiver.recv_deadline(deadline) {
-                Ok(msg) => msg,
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+        let mut sel = crossbeam_channel::Select::new();
+        let lsp_idx = sel.recv(&connection.receiver);
+        let comp_idx = sel.recv(&compiler_rx);
+
+        let oper = match state.next_diagnostic_deadline() {
+            Some(deadline) => match sel.select_deadline(deadline) {
+                Ok(oper) => oper,
+                Err(_) => {
                     publish_pending_diagnostics(connection, state)?;
                     continue;
                 }
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return Ok(()),
-            }
-        } else {
-            match connection.receiver.recv() {
-                Ok(msg) => msg,
-                Err(_) => return Ok(()),
-            }
+            },
+            None => sel.select(),
         };
 
-        match msg {
-            Message::Request(req) => {
-                if connection.handle_shutdown(&req)? {
-                    return Ok(());
+        if oper.index() == lsp_idx {
+            let msg = match oper.recv(&connection.receiver) {
+                Ok(msg) => msg,
+                Err(_) => return Ok(()),
+            };
+            match msg {
+                Message::Request(req) => {
+                    if connection.handle_shutdown(&req)? {
+                        return Ok(());
+                    }
+                    handle_request(connection, state, req)?;
                 }
-                handle_request(connection, state, req)?;
+                Message::Notification(notif) => {
+                    handle_notification(connection, state, notif)?;
+                }
+                Message::Response(_resp) => {}
             }
-            Message::Notification(notif) => {
-                handle_notification(connection, state, notif)?;
+        } else if oper.index() == comp_idx {
+            if let Ok((path, diags)) = oper.recv(&compiler_rx) {
+                state.diagnostic_store.set_compiler(&path, diags);
+                if let Some(u) = uri::from_path(&path) {
+                    let merged = state.diagnostic_store.merged(&path);
+                    send_diagnostics(connection, u, merged)?;
+                }
             }
-            Message::Response(_resp) => {}
         }
     }
 }
@@ -305,14 +328,13 @@ fn handle_notification(
             let params: DidSaveTextDocumentParams = serde_json::from_value(notif.params)?;
             if let Some(path) = uri::to_path(&params.text_document.uri) {
                 info!("document saved: {:?}", path);
-                // Run Crystal compiler diagnostics in the foreground.
-                // This blocks the main loop but the 30s timeout prevents hangs.
-                let compiler_diags = crystal_cli::check_file(&path).unwrap_or_default();
-                state.diagnostic_store.set_compiler(&path, compiler_diags);
-                if let Some(u) = uri::from_path(&path) {
-                    let merged = state.diagnostic_store.merged(&path);
-                    send_diagnostics(connection, u, merged)?;
-                }
+                // Run Crystal compiler diagnostics in a background thread so the
+                // main LSP loop stays responsive (compilation can take seconds).
+                let tx = state.compiler_tx.clone();
+                std::thread::spawn(move || {
+                    let diags = crystal_cli::check_file(&path).unwrap_or_default();
+                    let _ = tx.send((path, diags));
+                });
             }
         }
         "initialized" => {
