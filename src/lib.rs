@@ -113,8 +113,10 @@ impl zed::Extension for ZirconExtension {
         language_server_id: &zed::LanguageServerId,
         worktree: &zed::Worktree,
     ) -> Result<zed::Command> {
-        // Check PATH first (Story 5.4 fallback).
+        // Prefer a locally-installed binary on PATH so developers can build
+        // from source or install via a package manager.
         if let Some(path) = worktree.which("zircon-server") {
+            eprintln!("zircon: using zircon-server from PATH: {path}");
             return Ok(zed::Command {
                 command: path,
                 args: vec![],
@@ -123,6 +125,7 @@ impl zed::Extension for ZirconExtension {
         }
 
         let binary_path = self.binary_manager.server_binary_path(language_server_id)?;
+        eprintln!("zircon: using downloaded zircon-server: {binary_path}");
         Ok(zed::Command {
             command: binary_path,
             args: vec![],
