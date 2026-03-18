@@ -31,8 +31,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-        with:
-          submodules: true
+
+      - name: Checkout tree-sitter-crystal grammar
+        run: |
+          git clone https://github.com/crystal-lang-tools/tree-sitter-crystal grammars/crystal
+          cd grammars/crystal
+          git checkout 50ca9e6fcfb16a2cbcad59203cfd8ad650e25c49
 
       - uses: dtolnay/rust-toolchain@stable
         with:
