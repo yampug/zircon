@@ -96,7 +96,7 @@ fn build_hover_content(sym: &Symbol, source: &str) -> String {
         SymbolKind::Method | SymbolKind::Function | SymbolKind::Macro => {
             let signature = extract_signature(&lines, def_line);
             let doc = extract_doc_comment(&lines, def_line);
-            format_hover(&signature, &doc)
+            format_method_hover(&signature, &doc, sym)
         }
         SymbolKind::Class | SymbolKind::Module | SymbolKind::Struct | SymbolKind::Enum
         | SymbolKind::Lib => {
@@ -174,6 +174,59 @@ fn extract_doc_comment(lines: &[&str], def_line: usize) -> Option<String> {
 
 fn get_line(lines: &[&str], index: usize) -> Option<String> {
     lines.get(index).map(|l| l.trim().to_string())
+}
+
+/// Format hover for a method, appending inferred return type when there is no
+/// explicit annotation.  Inferred types are shown in italics to distinguish them.
+fn format_method_hover(signature: &str, doc: &Option<String>, sym: &Symbol) -> String {
+    // Check if the signature already contains an explicit return type (`: Type`
+    // after the closing paren or after the method name if no params).
+    let has_explicit = signature_has_return_type(signature);
+
+    let display_sig = if !has_explicit {
+        if let Some(ref inferred) = sym.return_type {
+            format!("{} : {}", signature.trim_end(), inferred)
+        } else {
+            signature.to_string()
+        }
+    } else {
+        signature.to_string()
+    };
+
+    let mut parts = Vec::new();
+    if !display_sig.is_empty() {
+        parts.push(format!("```crystal\n{}\n```", display_sig));
+    }
+    if !has_explicit {
+        if let Some(ref inferred) = sym.return_type {
+            parts.push(format!("*inferred return type: {}*", inferred));
+        }
+    }
+    if let Some(doc) = doc {
+        parts.push(doc.clone());
+    }
+    parts.join("\n\n")
+}
+
+/// Heuristic check: does the signature line contain an explicit return type?
+/// Looks for `: Type` after `)` or after the method name when there are no parens.
+fn signature_has_return_type(sig: &str) -> bool {
+    // If there's a closing paren, check for `: ` after it.
+    if let Some(paren_pos) = sig.rfind(')') {
+        let after = &sig[paren_pos + 1..];
+        return after.contains(':');
+    }
+    // No parens — check for `: ` after the method name (e.g., `def foo : String`).
+    // Skip past `def name` and check for `:`.
+    if let Some(def_pos) = sig.find("def ") {
+        let after_def = &sig[def_pos + 4..];
+        // The method name is the first word, check if there's a `:` after it.
+        if let Some(space_pos) = after_def.find(|c: char| c.is_whitespace()) {
+            let rest = &after_def[space_pos..];
+            return rest.trim_start().starts_with(':');
+        }
+    }
+    false
 }
 
 fn format_hover(code: &impl AsRef<str>, doc: &Option<String>) -> String {
@@ -460,5 +513,51 @@ mod tests {
 
         assert!(md.contains("@data"), "should show ivar name, got: {}", md);
         assert!(md.contains("Foo"), "should show class name, got: {}", md);
+    }
+
+    #[test]
+    fn test_hover_method_inferred_string() {
+        let mut index = DocumentIndex::new();
+        let path = PathBuf::from("/tmp/hover_infer.cr");
+        let source = "class Foo\n  def greet\n    \"hello\"\n  end\n\n  def run\n    greet\n  end\nend\n";
+        index.update_file(&path, source);
+
+        let mut parser = make_parser();
+        // Hover on "greet" call at line 6
+        let params = make_params("/tmp/hover_infer.cr", 6, 4);
+        let md = extract_md(handle(&index, &mut parser, params, Some(source)));
+
+        assert!(md.contains("def greet"), "should show signature, got: {}", md);
+        assert!(md.contains(": String"), "should show inferred String, got: {}", md);
+        assert!(md.contains("*inferred"), "should mark as inferred, got: {}", md);
+    }
+
+    #[test]
+    fn test_hover_method_explicit_type_no_inferred_label() {
+        let mut index = DocumentIndex::new();
+        let path = PathBuf::from("/tmp/hover_explicit.cr");
+        let source = "class Foo\n  def greet : String\n    \"hello\"\n  end\n\n  def run\n    greet\n  end\nend\n";
+        index.update_file(&path, source);
+
+        let mut parser = make_parser();
+        let params = make_params("/tmp/hover_explicit.cr", 6, 4);
+        let md = extract_md(handle(&index, &mut parser, params, Some(source)));
+
+        assert!(md.contains("def greet : String"), "should show explicit type, got: {}", md);
+        assert!(!md.contains("*inferred"), "should NOT show inferred label, got: {}", md);
+    }
+
+    #[test]
+    fn test_hover_method_inferred_constructor() {
+        let mut index = DocumentIndex::new();
+        let path = PathBuf::from("/tmp/hover_ctor.cr");
+        let source = "class Factory\n  def build\n    Widget.new\n  end\n\n  def run\n    build\n  end\nend\n";
+        index.update_file(&path, source);
+
+        let mut parser = make_parser();
+        let params = make_params("/tmp/hover_ctor.cr", 6, 4);
+        let md = extract_md(handle(&index, &mut parser, params, Some(source)));
+
+        assert!(md.contains(": Widget"), "should infer Widget, got: {}", md);
     }
 }

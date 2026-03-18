@@ -62,6 +62,8 @@ pub struct Symbol {
     pub def_end_col: usize,
     /// Enclosing class/module/struct name, if any.
     pub parent: Option<String>,
+    /// Inferred return type for methods (only set when no explicit annotation).
+    pub return_type: Option<String>,
 }
 
 /// Tracks the class hierarchy for a single class, struct, or module.
@@ -371,6 +373,14 @@ impl DocumentIndex {
             // enclosing scope (skipping the definition node itself).
             let parent = find_parent_scope(def_node, source);
 
+            // For methods, check for an explicit return type on the def node.
+            // If present, store it; inference will only apply when this is None.
+            let return_type = if kind == SymbolKind::Method || kind == SymbolKind::Function {
+                extract_explicit_return_type(def_node, source)
+            } else {
+                None
+            };
+
             symbols.push(Symbol {
                 name,
                 kind,
@@ -384,8 +394,12 @@ impl DocumentIndex {
                 def_end_line: def_end.row,
                 def_end_col: def_end.column,
                 parent,
+                return_type,
             });
         }
+
+        // Post-pass: infer return types for methods without explicit annotations.
+        infer_method_return_types(&tree, source, &mut symbols);
 
         symbols
     }
@@ -405,6 +419,260 @@ fn find_parent_scope(node: tree_sitter::Node, source: &str) -> Option<String> {
         current = n.parent();
     }
     None
+}
+
+/// Extract the explicit return type from a method/function definition node.
+/// The `type` field is `multiple: true` and includes the `:` token — we need
+/// to find the first *named* child with the `type` field.
+fn extract_explicit_return_type(def_node: tree_sitter::Node, source: &str) -> Option<String> {
+    let mut cursor = def_node.walk();
+    for child in def_node.children_by_field_name("type", &mut cursor) {
+        if child.is_named() {
+            return child.utf8_text(source.as_bytes()).ok().map(String::from);
+        }
+    }
+    None
+}
+
+/// Walk the tree to find method_def nodes and infer return types for symbols
+/// that don't have explicit return type annotations.
+fn infer_method_return_types(
+    tree: &tree_sitter::Tree,
+    source: &str,
+    symbols: &mut [Symbol],
+) {
+    let mut methods: HashMap<(usize, usize), String> = HashMap::new();
+    collect_method_return_types(tree.root_node(), source, &mut methods);
+
+    for sym in symbols.iter_mut() {
+        if (sym.kind == SymbolKind::Method || sym.kind == SymbolKind::Function)
+            && sym.return_type.is_none()
+        {
+            if let Some(inferred) = methods.remove(&(sym.def_start_line, sym.def_start_col)) {
+                sym.return_type = Some(inferred);
+            }
+        }
+    }
+}
+
+/// Recursively find method_def nodes and infer their return types.
+fn collect_method_return_types(
+    node: tree_sitter::Node,
+    source: &str,
+    results: &mut HashMap<(usize, usize), String>,
+) {
+    if node.kind() == "method_def" || node.kind() == "fun_def" {
+        // Skip methods with explicit return types.
+        if node.child_by_field_name("type").is_none() {
+            if let Some(body) = node.child_by_field_name("body") {
+                if let Some(inferred) = infer_return_type(body, source) {
+                    let pos = node.start_position();
+                    results.insert((pos.row, pos.column), inferred);
+                }
+            }
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_method_return_types(child, source, results);
+    }
+}
+
+/// Infer the return type of a method body by analyzing the last expression.
+fn infer_return_type(body: tree_sitter::Node, source: &str) -> Option<String> {
+    let last = last_expression(body)?;
+    infer_expression_type(last, source)
+}
+
+/// Find the last named expression in a body/expressions node.
+fn last_expression(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    let count = node.named_child_count();
+    if count == 0 {
+        return Some(node);
+    }
+    node.named_child(count - 1)
+}
+
+/// Infer the type of a single expression node.
+fn infer_expression_type(node: tree_sitter::Node, source: &str) -> Option<String> {
+    match node.kind() {
+        // Literals
+        "string" | "chained_string" | "heredoc_start" => Some("String".to_string()),
+        "integer" => Some("Int32".to_string()),
+        "float" => Some("Float64".to_string()),
+        "true" | "false" => Some("Bool".to_string()),
+        "nil" => Some("Nil".to_string()),
+        "symbol" => Some("Symbol".to_string()),
+        "char" => Some("Char".to_string()),
+        "array" => Some("Array".to_string()),
+        "hash" => Some("Hash".to_string()),
+        "tuple" => Some("Tuple".to_string()),
+        "named_tuple" => Some("NamedTuple".to_string()),
+        "regex" => Some("Regex".to_string()),
+        "range" => Some("Range".to_string()),
+
+        // String interpolation is always String
+        "string_interpolation" => Some("String".to_string()),
+
+        // Constructor calls: Foo.new → Foo
+        "call" => infer_call_type(node, source),
+
+        // Binary operations
+        "and" | "or" => Some("Bool".to_string()),
+
+        // If/unless → union of branch types
+        "if" | "unless" => infer_conditional_type(node, source),
+
+        // Case expression
+        "case" => infer_case_type(node, source),
+
+        // Expressions block → type of last expression
+        "expressions" => {
+            let last = last_expression(node)?;
+            infer_expression_type(last, source)
+        }
+
+        // Begin block → type of body
+        "begin" => {
+            if let Some(body) = node.child_by_field_name("body") {
+                let last = last_expression(body)?;
+                infer_expression_type(last, source)
+            } else {
+                None
+            }
+        }
+
+        // Return statement → type of the value
+        "return" => {
+            let child = node.named_child(0)?;
+            infer_expression_type(child, source)
+        }
+
+        _ => None,
+    }
+}
+
+/// Infer the return type of a method call.
+fn infer_call_type(node: tree_sitter::Node, source: &str) -> Option<String> {
+    let method = node.child_by_field_name("method")?;
+    let method_text = method.utf8_text(source.as_bytes()).ok()?;
+
+    // Constructor: Foo.new → Foo
+    if method_text == "new" {
+        let receiver = node.child_by_field_name("receiver")?;
+        let name = receiver.utf8_text(source.as_bytes()).ok()?;
+        if name.chars().next()?.is_uppercase() {
+            return Some(name.to_string());
+        }
+    }
+
+    // String-producing methods
+    if matches!(method_text, "to_s" | "inspect" | "chomp" | "strip"
+        | "downcase" | "upcase" | "gsub" | "sub" | "tr" | "join"
+        | "lstrip" | "rstrip" | "reverse") {
+        return Some("String".to_string());
+    }
+
+    // Comparison operators → Bool
+    if matches!(method_text, "==" | "!=" | "<" | ">" | "<=" | ">="
+        | "===" | "<=>" | "includes?" | "empty?" | "nil?" | "is_a?"
+        | "responds_to?" | "any?" | "all?" | "none?") {
+        return Some("Bool".to_string());
+    }
+
+    // Size/count → Int32
+    if matches!(method_text, "size" | "length" | "count" | "index") {
+        return Some("Int32".to_string());
+    }
+
+    // Arithmetic: if receiver is known numeric, result is numeric
+    if matches!(method_text, "+" | "-" | "*" | "/" | "%" | "**" | "&"
+        | "|" | "^" | "<<" | ">>" | "~") {
+        if let Some(receiver) = node.child_by_field_name("receiver") {
+            if let Some(recv_type) = infer_expression_type(receiver, source) {
+                if matches!(recv_type.as_str(),
+                    "Int32" | "Int64" | "UInt32" | "UInt64" | "Float32" | "Float64"
+                ) {
+                    return Some(recv_type);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Infer the type of an if/unless expression from its branches.
+fn infer_conditional_type(node: tree_sitter::Node, source: &str) -> Option<String> {
+    let mut types = Vec::new();
+
+    // Then branch (the body of the if)
+    if let Some(body) = node.child_by_field_name("body") {
+        if let Some(last) = last_expression(body) {
+            if let Some(t) = infer_expression_type(last, source) {
+                if !types.contains(&t) {
+                    types.push(t);
+                }
+            }
+        }
+    }
+
+    // Else branch
+    if let Some(else_node) = node.child_by_field_name("else") {
+        // The else node's body is its first named child (the expressions).
+        if let Some(else_body) = else_node.named_child(0) {
+            if let Some(last) = last_expression(else_body) {
+                if let Some(t) = infer_expression_type(last, source) {
+                    if !types.contains(&t) {
+                        types.push(t);
+                    }
+                }
+            }
+        }
+    }
+
+    match types.len() {
+        0 => None,
+        1 => Some(types.into_iter().next().unwrap()),
+        _ => Some(types.join(" | ")),
+    }
+}
+
+/// Infer the type of a case expression from its when branches.
+fn infer_case_type(node: tree_sitter::Node, source: &str) -> Option<String> {
+    let mut types = Vec::new();
+    let mut cursor = node.walk();
+
+    for child in node.children(&mut cursor) {
+        if child.kind() == "when" {
+            if let Some(body) = child.child_by_field_name("body") {
+                if let Some(last) = last_expression(body) {
+                    if let Some(t) = infer_expression_type(last, source) {
+                        if !types.contains(&t) {
+                            types.push(t);
+                        }
+                    }
+                }
+            }
+        } else if child.kind() == "else" {
+            if let Some(else_body) = child.named_child(0) {
+                if let Some(last) = last_expression(else_body) {
+                    if let Some(t) = infer_expression_type(last, source) {
+                        if !types.contains(&t) {
+                            types.push(t);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    match types.len() {
+        0 => None,
+        1 => Some(types.into_iter().next().unwrap()),
+        _ => Some(types.join(" | ")),
+    }
 }
 
 /// Recursively walk the tree to find class/struct/module definitions and
@@ -1000,5 +1268,61 @@ mod tests {
 
         let vars = idx.find_instance_vars("Empty");
         assert!(vars.is_empty());
+    }
+
+    #[test]
+    fn test_return_type_string_literal() {
+        let symbols = index_source("def greet\n  \"hello\"\nend\n");
+        let greet = symbols.iter().find(|s| s.name == "greet").unwrap();
+        assert_eq!(greet.return_type.as_deref(), Some("String"));
+    }
+
+    #[test]
+    fn test_return_type_integer_literal() {
+        let symbols = index_source("def count\n  42\nend\n");
+        let count = symbols.iter().find(|s| s.name == "count").unwrap();
+        assert_eq!(count.return_type.as_deref(), Some("Int32"));
+    }
+
+    #[test]
+    fn test_return_type_bool_comparison() {
+        let symbols = index_source("def valid?\n  x == 1\nend\n");
+        let valid = symbols.iter().find(|s| s.name == "valid?").unwrap();
+        assert_eq!(valid.return_type.as_deref(), Some("Bool"));
+    }
+
+    #[test]
+    fn test_return_type_constructor() {
+        let symbols = index_source("def build\n  User.new\nend\n");
+        let build = symbols.iter().find(|s| s.name == "build").unwrap();
+        assert_eq!(build.return_type.as_deref(), Some("User"));
+    }
+
+    #[test]
+    fn test_return_type_explicit_preserved() {
+        let symbols = index_source("def name : String\n  @name\nend\n");
+        let name = symbols.iter().find(|s| s.name == "name").unwrap();
+        assert_eq!(name.return_type.as_deref(), Some("String"));
+    }
+
+    #[test]
+    fn test_return_type_no_inference_for_unknown() {
+        let symbols = index_source("def process\n  do_something\nend\n");
+        let process = symbols.iter().find(|s| s.name == "process").unwrap();
+        assert_eq!(process.return_type, None);
+    }
+
+    #[test]
+    fn test_return_type_nil_literal() {
+        let symbols = index_source("def nothing\n  nil\nend\n");
+        let nothing = symbols.iter().find(|s| s.name == "nothing").unwrap();
+        assert_eq!(nothing.return_type.as_deref(), Some("Nil"));
+    }
+
+    #[test]
+    fn test_return_type_float_literal() {
+        let symbols = index_source("def pi\n  3.14\nend\n");
+        let pi = symbols.iter().find(|s| s.name == "pi").unwrap();
+        assert_eq!(pi.return_type.as_deref(), Some("Float64"));
     }
 }
