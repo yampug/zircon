@@ -49,6 +49,8 @@ struct ServerState {
     compiler_tx: crossbeam_channel::Sender<(PathBuf, Vec<lsp_types::Diagnostic>)>,
     /// Receiver for background compiler diagnostic results.
     compiler_rx: crossbeam_channel::Receiver<(PathBuf, Vec<lsp_types::Diagnostic>)>,
+    /// Cache for macro expansions: (file, line, col) → expanded code.
+    macro_cache: hover::MacroExpansionCache,
 }
 
 impl ServerState {
@@ -70,6 +72,7 @@ impl ServerState {
             diagnostic_store: DiagnosticStore::new(),
             compiler_tx,
             compiler_rx,
+            macro_cache: hover::MacroExpansionCache::new(),
         };
 
         // Scan workspace and index all Crystal files.
@@ -245,8 +248,13 @@ fn handle_request(
                 .as_str()
                 .strip_prefix("file://")
                 .and_then(|p| state.get_source(Path::new(p)));
-            let result =
-                hover::handle(&state.index, &mut state.parser, params, source.as_deref());
+            let result = hover::handle(
+                &state.index,
+                &mut state.parser,
+                params,
+                source.as_deref(),
+                &mut state.macro_cache,
+            );
             let resp = Response::new_ok(id, result);
             connection.sender.send(Message::Response(resp))?;
         }
@@ -306,6 +314,7 @@ fn handle_notification(
                 if let Some(change) = params.content_changes.into_iter().last() {
                     state.index.update_file(&path, &change.text);
                     state.open_docs.insert(path.clone(), change.text);
+                    state.macro_cache.invalidate(&path);
                     state.schedule_diagnostics(path);
                 }
             }

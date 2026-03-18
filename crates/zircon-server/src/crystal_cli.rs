@@ -122,6 +122,38 @@ pub fn is_nil_risk(message: &str) -> bool {
             || message.contains("| Nil"))
 }
 
+/// Run `crystal tool expand` at a specific cursor position and return the
+/// expanded code. Returns `None` if the crystal binary is not found or the
+/// expansion fails.
+pub fn macro_expand(file: &Path, line: u32, col: u32) -> Option<String> {
+    let crystal = find_crystal_binary()?;
+    let cursor = format!("{}:{}:{}", file.display(), line, col);
+
+    let output = match Command::new(&crystal)
+        .args(["tool", "expand", "-c", &cursor])
+        .arg(file)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            warn!("failed to spawn crystal tool expand: {}", e);
+            return None;
+        }
+    };
+
+    let result = wait_with_timeout(output, COMPILER_TIMEOUT)?;
+    let stdout = String::from_utf8_lossy(&result.stdout).to_string();
+
+    if stdout.trim().is_empty() {
+        debug!("crystal tool expand produced no output");
+        return None;
+    }
+
+    Some(stdout.trim().to_string())
+}
+
 /// Locate the `crystal` binary on PATH.
 fn find_crystal_binary() -> Option<String> {
     let result = Command::new("which").arg("crystal").output().ok()?;
