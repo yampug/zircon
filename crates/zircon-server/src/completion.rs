@@ -6,12 +6,15 @@ use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionList, CompletionParams, CompletionResponse,
 };
 
+use tree_sitter::{Parser, Point};
+
 use crate::index::{DocumentIndex, Symbol, SymbolKind};
 use crate::uri;
 
 /// Handle a `textDocument/completion` request.
 pub fn handle(
     index: &DocumentIndex,
+    parser: &mut Parser,
     params: CompletionParams,
     current_source: Option<&str>,
 ) -> Option<CompletionResponse> {
@@ -25,7 +28,9 @@ pub fn handle(
     let col = position.character as usize;
     let prefix = if col <= line.len() { &line[..col] } else { line };
 
-    let items = if let Some(receiver) = detect_dot_completion(prefix) {
+    let items = if let Some(ivar_prefix) = detect_ivar_completion(prefix) {
+        complete_ivar(index, parser, source, position, &ivar_prefix)
+    } else if let Some(receiver) = detect_dot_completion(prefix) {
         complete_dot(index, &receiver)
     } else if let Some(scope) = detect_scope_completion(prefix) {
         complete_scope(index, &scope)
@@ -85,6 +90,93 @@ fn detect_require_completion(prefix: &str) -> Option<String> {
         return None;
     }
     Some(after.to_string())
+}
+
+/// Detect `@` or `@partial` pattern for instance variable completion.
+fn detect_ivar_completion(prefix: &str) -> Option<String> {
+    let trimmed = prefix.trim_end();
+    // Find `@` not followed by `@` (which would be a class var).
+    let at_pos = trimmed.rfind('@')?;
+    // Skip class variables (@@).
+    if at_pos > 0 && trimmed.as_bytes().get(at_pos - 1) == Some(&b'@') {
+        return None;
+    }
+    let after_at = &trimmed[at_pos + 1..];
+    // Make sure the partial is a valid identifier prefix (or empty).
+    if after_at.chars().all(|c| c.is_alphanumeric() || c == '_') {
+        Some(after_at.to_string())
+    } else {
+        None
+    }
+}
+
+/// Complete instance variables after `@` inside a class body.
+fn complete_ivar(
+    index: &DocumentIndex,
+    parser: &mut Parser,
+    source: &str,
+    position: lsp_types::Position,
+    partial: &str,
+) -> Vec<CompletionItem> {
+    // Use tree-sitter to find the enclosing class name.
+    let class_name = match find_enclosing_class_at(parser, source, position) {
+        Some(name) => name,
+        None => return vec![],
+    };
+
+    index
+        .find_instance_vars(&class_name)
+        .iter()
+        .filter(|iv| {
+            if partial.is_empty() {
+                true
+            } else {
+                // Match against the name without the leading `@`.
+                iv.name
+                    .strip_prefix('@')
+                    .unwrap_or(&iv.name)
+                    .starts_with(partial)
+            }
+        })
+        .map(|iv| {
+            let detail = iv
+                .type_name
+                .as_ref()
+                .map(|t| format!("{} ({})", t, class_name))
+                .unwrap_or_else(|| format!("({})", class_name));
+            CompletionItem {
+                label: iv.name.clone(),
+                kind: Some(CompletionItemKind::FIELD),
+                detail: Some(detail),
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
+/// Use tree-sitter to find the enclosing class/struct name at a given position.
+fn find_enclosing_class_at(
+    parser: &mut Parser,
+    source: &str,
+    position: lsp_types::Position,
+) -> Option<String> {
+    let tree = parser.parse(source, None)?;
+    let point = Point {
+        row: position.line as usize,
+        column: position.character as usize,
+    };
+    let node = tree.root_node().descendant_for_point_range(point, point)?;
+
+    let mut current = Some(node);
+    while let Some(n) = current {
+        if n.kind() == "class_def" || n.kind() == "struct_def" {
+            if let Some(name_node) = n.child_by_field_name("name") {
+                return name_node.utf8_text(source.as_bytes()).ok().map(String::from);
+            }
+        }
+        current = n.parent();
+    }
+    None
 }
 
 /// Extract the partial word immediately before the cursor.
@@ -288,6 +380,13 @@ mod tests {
     use crate::index::DocumentIndex;
     use lsp_types::Position;
 
+    fn make_parser() -> Parser {
+        let lang = tree_sitter_crystal::LANGUAGE.into();
+        let mut parser = Parser::new();
+        parser.set_language(&lang).unwrap();
+        parser
+    }
+
     fn make_params(path: &str, line: u32, character: u32) -> CompletionParams {
         let uri = uri::from_path(Path::new(path)).unwrap();
         CompletionParams {
@@ -327,7 +426,7 @@ mod tests {
 
         let source = "u = User.new\nu.\n";
         let params = make_params("/tmp/comp.cr", 1, 2);
-        let labels = extract_labels(handle(&index, params, Some(source)));
+        let labels = extract_labels(handle(&index, &mut make_parser(), params, Some(source)));
 
         // "User." should show User's methods
         // But "u." — we can't infer the type, so fallback to all methods
@@ -345,7 +444,7 @@ mod tests {
 
         let source = "User.\n";
         let params = make_params("/tmp/comp.cr", 0, 5);
-        let labels = extract_labels(handle(&index, params, Some(source)));
+        let labels = extract_labels(handle(&index, &mut make_parser(), params, Some(source)));
 
         assert!(labels.contains(&"name".to_string()));
         assert!(labels.contains(&"email".to_string()));
@@ -361,7 +460,7 @@ mod tests {
 
         let source = "HTTP::\n";
         let params = make_params("/tmp/comp.cr", 0, 6);
-        let labels = extract_labels(handle(&index, params, Some(source)));
+        let labels = extract_labels(handle(&index, &mut make_parser(), params, Some(source)));
 
         assert!(labels.contains(&"Client".to_string()));
         assert!(labels.contains(&"VERSION".to_string()));
@@ -377,7 +476,7 @@ mod tests {
 
         let source = "User\n";
         let params = make_params("/tmp/comp.cr", 0, 4);
-        let labels = extract_labels(handle(&index, params, Some(source)));
+        let labels = extract_labels(handle(&index, &mut make_parser(), params, Some(source)));
 
         assert!(labels.contains(&"UserProfile".to_string()));
         assert!(labels.contains(&"UserSession".to_string()));
@@ -394,7 +493,7 @@ mod tests {
 
         let source = "\n";
         let params = make_params("/tmp/comp.cr", 0, 0);
-        let items = extract_items(handle(&index, params, Some(source)));
+        let items = extract_items(handle(&index, &mut make_parser(), params, Some(source)));
 
         let foo = items.iter().find(|i| i.label == "Foo").unwrap();
         assert_eq!(foo.kind, Some(CompletionItemKind::CLASS));
@@ -416,7 +515,7 @@ mod tests {
 
         let source = "Foo.\n";
         let params = make_params("/tmp/comp.cr", 0, 4);
-        let items = extract_items(handle(&index, params, Some(source)));
+        let items = extract_items(handle(&index, &mut make_parser(), params, Some(source)));
 
         let bar = items.iter().find(|i| i.label == "bar").unwrap();
         assert_eq!(bar.detail, Some("(Foo)".to_string()));
@@ -434,7 +533,7 @@ mod tests {
         let app_path = tmp.path().join("src/app.cr");
         let source = "require \"./models/\n";
         let params = make_params(app_path.to_str().unwrap(), 0, 18);
-        let labels = extract_labels(handle(&index, params, Some(source)));
+        let labels = extract_labels(handle(&index, &mut make_parser(), params, Some(source)));
 
         assert!(labels.contains(&"user".to_string()));
         assert!(labels.contains(&"post".to_string()));
@@ -470,5 +569,63 @@ mod tests {
         );
         // Closed string — no completion.
         assert_eq!(detect_require_completion("require \"json\""), None);
+    }
+
+    #[test]
+    fn test_detect_ivar_completion() {
+        assert_eq!(detect_ivar_completion("    @"), Some("".to_string()));
+        assert_eq!(detect_ivar_completion("    @na"), Some("na".to_string()));
+        assert_eq!(detect_ivar_completion("    @@"), None); // class var
+        assert_eq!(detect_ivar_completion("abc"), None);
+    }
+
+    #[test]
+    fn test_ivar_completion_in_class() {
+        let mut index = DocumentIndex::new();
+        index.update_file(
+            Path::new("/tmp/user.cr"),
+            "class User\n  @name : String\n  @age : Int32\n  property email : String\nend\n",
+        );
+
+        // Source with cursor inside the class body after `@`
+        let source = "class User\n  @name : String\n  @age : Int32\n  property email : String\n\n  def show\n    @\n  end\nend\n";
+        let params = make_params("/tmp/user.cr", 6, 5);
+        let labels = extract_labels(handle(&index, &mut make_parser(), params, Some(source)));
+
+        assert!(labels.contains(&"@name".to_string()), "should suggest @name, got: {:?}", labels);
+        assert!(labels.contains(&"@age".to_string()), "should suggest @age, got: {:?}", labels);
+        assert!(labels.contains(&"@email".to_string()), "should suggest @email, got: {:?}", labels);
+    }
+
+    #[test]
+    fn test_ivar_completion_with_prefix() {
+        let mut index = DocumentIndex::new();
+        index.update_file(
+            Path::new("/tmp/user.cr"),
+            "class User\n  @name : String\n  @age : Int32\nend\n",
+        );
+
+        let source = "class User\n  @name : String\n  @age : Int32\n\n  def show\n    @na\n  end\nend\n";
+        let params = make_params("/tmp/user.cr", 5, 7);
+        let labels = extract_labels(handle(&index, &mut make_parser(), params, Some(source)));
+
+        assert!(labels.contains(&"@name".to_string()), "should suggest @name, got: {:?}", labels);
+        assert!(!labels.contains(&"@age".to_string()), "should not suggest @age with prefix 'na'");
+    }
+
+    #[test]
+    fn test_ivar_completion_outside_class() {
+        let mut index = DocumentIndex::new();
+        index.update_file(
+            Path::new("/tmp/user.cr"),
+            "class User\n  @name : String\nend\n",
+        );
+
+        // Cursor is at top level, not inside a class
+        let source = "@\n";
+        let params = make_params("/tmp/top.cr", 0, 1);
+        let labels = extract_labels(handle(&index, &mut make_parser(), params, Some(source)));
+
+        assert!(labels.is_empty(), "should not suggest ivars outside class, got: {:?}", labels);
     }
 }

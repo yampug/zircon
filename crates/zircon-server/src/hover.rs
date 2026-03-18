@@ -40,6 +40,14 @@ pub fn handle(
         }
     }
 
+    // Check if cursor is on an instance variable — show type info from ivar index.
+    if node.kind() == "instance_var" {
+        let ivar_name = node.utf8_text(current_source.as_bytes()).ok()?;
+        if let Some(hover) = hover_instance_var(index, ivar_name, node, current_source) {
+            return Some(hover);
+        }
+    }
+
     let (name, kinds) = classify_node(node, current_source)?;
 
     // Search the index for definitions.
@@ -178,6 +186,46 @@ fn format_hover(code: &impl AsRef<str>, doc: &Option<String>) -> String {
         parts.push(doc.clone());
     }
     parts.join("\n\n")
+}
+
+/// Build hover content for an instance variable using the ivar index.
+fn hover_instance_var(
+    index: &DocumentIndex,
+    ivar_name: &str,
+    node: tree_sitter::Node,
+    source: &str,
+) -> Option<Hover> {
+    // Find the enclosing class to look up the ivar.
+    let class_name = find_enclosing_class(node, source)?;
+    let ivar = index.find_instance_var(&class_name, ivar_name)?;
+
+    let md = if let Some(ref type_name) = ivar.type_name {
+        format!("```crystal\n{} : {}\n```\n\n({})", ivar_name, type_name, class_name)
+    } else {
+        format!("```crystal\n{}\n```\n\n({})", ivar_name, class_name)
+    };
+
+    Some(Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: md,
+        }),
+        range: None,
+    })
+}
+
+/// Walk up the AST to find the enclosing class/struct name.
+fn find_enclosing_class(node: tree_sitter::Node, source: &str) -> Option<String> {
+    let mut current = Some(node);
+    while let Some(n) = current {
+        if n.kind() == "class_def" || n.kind() == "struct_def" {
+            if let Some(name_node) = n.child_by_field_name("name") {
+                return name_node.utf8_text(source.as_bytes()).ok().map(String::from);
+            }
+        }
+        current = n.parent();
+    }
+    None
 }
 
 /// Build hover content for a `require` path.
@@ -367,5 +415,50 @@ mod tests {
         let md = extract_md(handle(&index, &mut parser, params, Some(source)));
 
         assert!(md.contains("stdlib/shard"), "should indicate stdlib, got: {}", md);
+    }
+
+    #[test]
+    fn test_hover_ivar_with_type() {
+        let mut index = DocumentIndex::new();
+        let path = PathBuf::from("/tmp/hover_ivar_type.cr");
+        let source = "class User\n  @name : String\n\n  def show\n    @name\n  end\nend\n";
+        index.update_file(&path, source);
+
+        let mut parser = make_parser();
+        // Hover on @name at line 4, col 4
+        let params = make_params("/tmp/hover_ivar_type.cr", 4, 4);
+        let md = extract_md(handle(&index, &mut parser, params, Some(source)));
+
+        assert!(md.contains("@name : String"), "should show type, got: {}", md);
+        assert!(md.contains("User"), "should show class name, got: {}", md);
+    }
+
+    #[test]
+    fn test_hover_ivar_from_property() {
+        let mut index = DocumentIndex::new();
+        let path = PathBuf::from("/tmp/hover_ivar_prop.cr");
+        let source = "class User\n  property name : String\n\n  def show\n    @name\n  end\nend\n";
+        index.update_file(&path, source);
+
+        let mut parser = make_parser();
+        let params = make_params("/tmp/hover_ivar_prop.cr", 4, 4);
+        let md = extract_md(handle(&index, &mut parser, params, Some(source)));
+
+        assert!(md.contains("@name : String"), "should show type from property, got: {}", md);
+    }
+
+    #[test]
+    fn test_hover_ivar_no_type() {
+        let mut index = DocumentIndex::new();
+        let path = PathBuf::from("/tmp/hover_ivar_notype.cr");
+        let source = "class Foo\n  @data = something\n\n  def show\n    @data\n  end\nend\n";
+        index.update_file(&path, source);
+
+        let mut parser = make_parser();
+        let params = make_params("/tmp/hover_ivar_notype.cr", 4, 4);
+        let md = extract_md(handle(&index, &mut parser, params, Some(source)));
+
+        assert!(md.contains("@data"), "should show ivar name, got: {}", md);
+        assert!(md.contains("Foo"), "should show class name, got: {}", md);
     }
 }

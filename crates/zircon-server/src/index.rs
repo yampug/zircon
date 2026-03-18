@@ -72,6 +72,16 @@ pub struct ClassInfo {
     pub extends: Vec<String>,
 }
 
+/// An instance variable with optional type information.
+#[derive(Debug, Clone)]
+pub struct InstanceVariable {
+    pub name: String,
+    pub type_name: Option<String>,
+    pub class_name: String,
+    pub line: usize,
+    pub col: usize,
+}
+
 /// Parses Crystal source files and maintains a per-file symbol index.
 pub struct DocumentIndex {
     parser: Parser,
@@ -79,6 +89,8 @@ pub struct DocumentIndex {
     files: HashMap<PathBuf, Vec<Symbol>>,
     /// Maps class/module name → hierarchy info (superclass, includes, extends).
     pub class_hierarchy: HashMap<String, ClassInfo>,
+    /// Maps class name → instance variables with type info.
+    pub instance_vars: HashMap<String, Vec<InstanceVariable>>,
 }
 
 /// Node kinds that represent enclosing scopes for parent tracking.
@@ -103,6 +115,7 @@ impl DocumentIndex {
             query,
             files: HashMap::new(),
             class_hierarchy: HashMap::new(),
+            instance_vars: HashMap::new(),
         }
     }
 
@@ -120,9 +133,13 @@ impl DocumentIndex {
             Ok(source) => {
                 let symbols = self.extract_symbols(&source);
                 let hierarchy = self.extract_hierarchy(&source);
+                let ivars = self.extract_instance_vars(&source);
                 self.files.insert(path.to_path_buf(), symbols);
                 for (name, info) in hierarchy {
                     self.class_hierarchy.insert(name, info);
+                }
+                for (class_name, vars) in ivars {
+                    self.instance_vars.insert(class_name, vars);
                 }
             }
             Err(e) => {
@@ -136,9 +153,13 @@ impl DocumentIndex {
     pub fn update_file(&mut self, path: &Path, source: &str) {
         let symbols = self.extract_symbols(source);
         let hierarchy = self.extract_hierarchy(source);
+        let ivars = self.extract_instance_vars(source);
         self.files.insert(path.to_path_buf(), symbols);
         for (name, info) in hierarchy {
             self.class_hierarchy.insert(name, info);
+        }
+        for (class_name, vars) in ivars {
+            self.instance_vars.insert(class_name, vars);
         }
     }
 
@@ -250,6 +271,36 @@ impl DocumentIndex {
         }
 
         Vec::new()
+    }
+
+    /// Return instance variables for a given class name.
+    pub fn find_instance_vars(&self, class_name: &str) -> &[InstanceVariable] {
+        self.instance_vars
+            .get(class_name)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// Find a specific instance variable by name within a class.
+    pub fn find_instance_var(&self, class_name: &str, ivar_name: &str) -> Option<&InstanceVariable> {
+        self.instance_vars
+            .get(class_name)?
+            .iter()
+            .find(|iv| iv.name == ivar_name)
+    }
+
+    /// Parse source to extract instance variables per class.
+    fn extract_instance_vars(
+        &mut self,
+        source: &str,
+    ) -> Vec<(String, Vec<InstanceVariable>)> {
+        let tree = match self.parser.parse(source, None) {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+        let mut result: HashMap<String, Vec<InstanceVariable>> = HashMap::new();
+        collect_instance_vars(tree.root_node(), source, &mut result);
+        result.into_iter().collect()
     }
 
     /// Parse source to extract class hierarchy (superclass, include, extend).
@@ -422,6 +473,244 @@ fn collect_includes_extends(body: tree_sitter::Node, source: &str, info: &mut Cl
             _ => {}
         }
     }
+}
+
+/// Recursively walk the tree to find class/struct bodies and extract instance
+/// variables from assignments, type declarations, and property/getter/setter macros.
+fn collect_instance_vars(
+    node: tree_sitter::Node,
+    source: &str,
+    result: &mut HashMap<String, Vec<InstanceVariable>>,
+) {
+    match node.kind() {
+        "class_def" | "struct_def" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                if let Ok(class_name) = name_node.utf8_text(source.as_bytes()) {
+                    if let Some(body) = node.child_by_field_name("body") {
+                        let vars = extract_ivars_from_body(body, class_name, source);
+                        if !vars.is_empty() {
+                            result
+                                .entry(class_name.to_string())
+                                .or_default()
+                                .extend(vars);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_instance_vars(child, source, result);
+    }
+}
+
+/// Extract instance variables from a class/struct body node.
+fn extract_ivars_from_body(
+    body: tree_sitter::Node,
+    class_name: &str,
+    source: &str,
+) -> Vec<InstanceVariable> {
+    let mut vars = Vec::new();
+    let mut seen = HashSet::new();
+    let mut cursor = body.walk();
+
+    for child in body.children(&mut cursor) {
+        match child.kind() {
+            // @name = value
+            "assign" => {
+                if let Some(lhs) = child.child_by_field_name("lhs") {
+                    if lhs.kind() == "instance_var" {
+                        if let Ok(name) = lhs.utf8_text(source.as_bytes()) {
+                            if seen.insert(name.to_string()) {
+                                let type_name = child
+                                    .child_by_field_name("rhs")
+                                    .and_then(|rhs| infer_type_from_rhs(rhs, source));
+                                let pos = lhs.start_position();
+                                vars.push(InstanceVariable {
+                                    name: name.to_string(),
+                                    type_name,
+                                    class_name: class_name.to_string(),
+                                    line: pos.row,
+                                    col: pos.column,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+            // @name : Type
+            "type_declaration" => {
+                if let Some(var_node) = child.child_by_field_name("var") {
+                    if var_node.kind() == "instance_var" {
+                        if let Ok(name) = var_node.utf8_text(source.as_bytes()) {
+                            let type_name = child
+                                .child_by_field_name("type")
+                                .and_then(|t| t.utf8_text(source.as_bytes()).ok())
+                                .map(|s| s.to_string());
+                            let pos = var_node.start_position();
+                            // Type declaration takes priority — replace any prior entry.
+                            seen.insert(name.to_string());
+                            vars.retain(|v| v.name != name);
+                            vars.push(InstanceVariable {
+                                name: name.to_string(),
+                                type_name,
+                                class_name: class_name.to_string(),
+                                line: pos.row,
+                                col: pos.column,
+                            });
+                        }
+                    }
+                }
+            }
+            // property/getter/setter macros
+            "call" => {
+                if let Some(method) = child.child_by_field_name("method") {
+                    if let Ok(macro_name) = method.utf8_text(source.as_bytes()) {
+                        if is_property_macro(macro_name) {
+                            if let Some(args) = child.child_by_field_name("arguments") {
+                                extract_ivar_from_property_macro(
+                                    args,
+                                    class_name,
+                                    source,
+                                    &mut vars,
+                                    &mut seen,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    vars
+}
+
+/// Check if a method name is a property/getter/setter macro.
+fn is_property_macro(name: &str) -> bool {
+    let base = name.trim_end_matches(|c| c == '?' || c == '!');
+    matches!(
+        base,
+        "property" | "getter" | "setter"
+            | "class_property" | "class_getter" | "class_setter"
+    )
+}
+
+/// Extract instance variable info from a property/getter/setter macro's arguments.
+fn extract_ivar_from_property_macro(
+    args: tree_sitter::Node,
+    class_name: &str,
+    source: &str,
+    vars: &mut Vec<InstanceVariable>,
+    seen: &mut HashSet<String>,
+) {
+    let mut cursor = args.walk();
+    for child in args.children(&mut cursor) {
+        match child.kind() {
+            // Typed form: `property name : String`
+            "type_declaration" => {
+                if let Some(var_node) = child.child_by_field_name("var") {
+                    if let Ok(prop_name) = var_node.utf8_text(source.as_bytes()) {
+                        let ivar_name = format!("@{}", prop_name);
+                        let type_name = child
+                            .child_by_field_name("type")
+                            .and_then(|t| t.utf8_text(source.as_bytes()).ok())
+                            .map(|s| s.to_string());
+                        let pos = var_node.start_position();
+                        if seen.insert(ivar_name.clone()) {
+                            vars.push(InstanceVariable {
+                                name: ivar_name,
+                                type_name,
+                                class_name: class_name.to_string(),
+                                line: pos.row,
+                                col: pos.column,
+                            });
+                        }
+                    }
+                }
+            }
+            // Untyped form: `getter name` or `getter :name`
+            "identifier" => {
+                if let Ok(prop_name) = child.utf8_text(source.as_bytes()) {
+                    let ivar_name = format!("@{}", prop_name);
+                    let pos = child.start_position();
+                    if seen.insert(ivar_name.clone()) {
+                        vars.push(InstanceVariable {
+                            name: ivar_name,
+                            type_name: None,
+                            class_name: class_name.to_string(),
+                            line: pos.row,
+                            col: pos.column,
+                        });
+                    }
+                }
+            }
+            "symbol" => {
+                if let Ok(sym_text) = child.utf8_text(source.as_bytes()) {
+                    let prop_name = sym_text.trim_start_matches(':');
+                    let ivar_name = format!("@{}", prop_name);
+                    let pos = child.start_position();
+                    if seen.insert(ivar_name.clone()) {
+                        vars.push(InstanceVariable {
+                            name: ivar_name,
+                            type_name: None,
+                            class_name: class_name.to_string(),
+                            line: pos.row,
+                            col: pos.column,
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Infer a type from the RHS of an assignment (e.g., `SomeClass.new` → "SomeClass").
+fn infer_type_from_rhs(rhs: tree_sitter::Node, source: &str) -> Option<String> {
+    if rhs.kind() == "call" {
+        let method = rhs.child_by_field_name("method")?;
+        let method_text = method.utf8_text(source.as_bytes()).ok()?;
+        if method_text == "new" {
+            let receiver = rhs.child_by_field_name("receiver")?;
+            let name = receiver.utf8_text(source.as_bytes()).ok()?;
+            if name.chars().next()?.is_uppercase() {
+                return Some(name.to_string());
+            }
+        }
+    }
+    // String literal → String
+    if rhs.kind() == "string" {
+        return Some("String".to_string());
+    }
+    // Integer literal → Int32
+    if rhs.kind() == "integer" {
+        return Some("Int32".to_string());
+    }
+    // Float literal → Float64
+    if rhs.kind() == "float" {
+        return Some("Float64".to_string());
+    }
+    // Bool literals
+    if rhs.kind() == "true" || rhs.kind() == "false" {
+        return Some("Bool".to_string());
+    }
+    // Array literal
+    if rhs.kind() == "array" {
+        return Some("Array".to_string());
+    }
+    // Hash literal
+    if rhs.kind() == "hash" {
+        return Some("Hash".to_string());
+    }
+    // Nil literal
+    if rhs.kind() == "nil" {
+        return Some("Nil".to_string());
+    }
+    None
 }
 
 #[cfg(test)]
@@ -643,5 +932,73 @@ mod tests {
 
         let results = idx.find_method_in_hierarchy("Foo", "nonexistent");
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_ivar_direct_assignment() {
+        let mut idx = DocumentIndex::new();
+        idx.update_file(
+            Path::new("a.cr"),
+            "class User\n  @name = \"\"\n  @age = 0\nend\n",
+        );
+
+        let vars = idx.find_instance_vars("User");
+        assert_eq!(vars.len(), 2);
+        let name_var = vars.iter().find(|v| v.name == "@name").unwrap();
+        assert_eq!(name_var.type_name.as_deref(), Some("String"));
+        let age_var = vars.iter().find(|v| v.name == "@age").unwrap();
+        assert_eq!(age_var.type_name.as_deref(), Some("Int32"));
+    }
+
+    #[test]
+    fn test_ivar_type_declaration() {
+        let mut idx = DocumentIndex::new();
+        idx.update_file(
+            Path::new("a.cr"),
+            "class User\n  @name : String\n  @email : String?\nend\n",
+        );
+
+        let vars = idx.find_instance_vars("User");
+        assert_eq!(vars.len(), 2);
+        let name_var = vars.iter().find(|v| v.name == "@name").unwrap();
+        assert_eq!(name_var.type_name.as_deref(), Some("String"));
+    }
+
+    #[test]
+    fn test_ivar_from_property_macro() {
+        let mut idx = DocumentIndex::new();
+        idx.update_file(
+            Path::new("a.cr"),
+            "class User\n  property name : String\n  getter age : Int32\n  setter email : String\nend\n",
+        );
+
+        let vars = idx.find_instance_vars("User");
+        assert_eq!(vars.len(), 3);
+        assert!(vars.iter().any(|v| v.name == "@name" && v.type_name.as_deref() == Some("String")));
+        assert!(vars.iter().any(|v| v.name == "@age" && v.type_name.as_deref() == Some("Int32")));
+        assert!(vars.iter().any(|v| v.name == "@email" && v.type_name.as_deref() == Some("String")));
+    }
+
+    #[test]
+    fn test_ivar_constructor_inference() {
+        let mut idx = DocumentIndex::new();
+        idx.update_file(
+            Path::new("a.cr"),
+            "class App\n  @logger = Logger.new\nend\n",
+        );
+
+        let vars = idx.find_instance_vars("App");
+        assert_eq!(vars.len(), 1);
+        assert_eq!(vars[0].name, "@logger");
+        assert_eq!(vars[0].type_name.as_deref(), Some("Logger"));
+    }
+
+    #[test]
+    fn test_ivar_empty_class() {
+        let mut idx = DocumentIndex::new();
+        idx.update_file(Path::new("a.cr"), "class Empty\nend\n");
+
+        let vars = idx.find_instance_vars("Empty");
+        assert!(vars.is_empty());
     }
 }

@@ -260,7 +260,7 @@ fn handle_request(
                 .strip_prefix("file://")
                 .and_then(|p| state.get_source(Path::new(p)));
             let result =
-                completion::handle(&state.index, params, source.as_deref());
+                completion::handle(&state.index, &mut state.parser, params, source.as_deref());
             let resp = Response::new_ok(id, result);
             connection.sender.send(Message::Response(resp))?;
         }
