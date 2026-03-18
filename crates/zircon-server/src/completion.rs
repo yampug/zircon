@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionList, CompletionParams, CompletionResponse,
@@ -239,7 +239,51 @@ fn complete_scope(index: &DocumentIndex, scope: &str) -> Vec<CompletionItem> {
         .collect()
 }
 
-/// Complete inside `require "..."` — suggest relative file paths.
+/// Common Crystal standard library modules for completion suggestions.
+const STDLIB_MODULES: &[&str] = &[
+    "benchmark",
+    "big",
+    "bit_array",
+    "colorize",
+    "complex",
+    "compress/gzip",
+    "compress/zip",
+    "compress/zlib",
+    "crypto/bcrypt",
+    "csv",
+    "digest",
+    "digest/md5",
+    "digest/sha1",
+    "digest/sha256",
+    "ecr",
+    "file_utils",
+    "html",
+    "http",
+    "http/client",
+    "http/server",
+    "ini",
+    "json",
+    "log",
+    "mime",
+    "oauth",
+    "oauth2",
+    "openssl",
+    "option_parser",
+    "random",
+    "regex",
+    "signal",
+    "socket",
+    "spec",
+    "string_pool",
+    "string_scanner",
+    "uri",
+    "uuid",
+    "xml",
+    "yaml",
+];
+
+/// Complete inside `require "..."` — suggest relative file paths, shard names,
+/// and common stdlib modules.
 fn complete_require(current_file: &Path, partial: &str) -> Vec<CompletionItem> {
     let from_dir = match current_file.parent() {
         Some(d) => d,
@@ -267,20 +311,84 @@ fn complete_require(current_file: &Path, partial: &str) -> Vec<CompletionItem> {
             .collect();
     }
 
-    // For empty or partial bare names: suggest starting with ./
-    let target_dir = from_dir;
-    list_cr_files(target_dir, partial)
-        .into_iter()
-        .map(|name| {
-            let insert = format!("./{}", name);
-            CompletionItem {
-                label: name,
-                kind: Some(CompletionItemKind::FILE),
-                insert_text: Some(insert),
-                ..Default::default()
+    // For bare names: combine shard names, stdlib modules, and local files.
+    let mut items = Vec::new();
+
+    // Shard names from lib/*/
+    if let Some(lib_dir) = find_lib_dir(current_file) {
+        for name in list_shard_names(&lib_dir) {
+            if partial.is_empty() || name.starts_with(partial) {
+                items.push(CompletionItem {
+                    label: name,
+                    kind: Some(CompletionItemKind::MODULE),
+                    detail: Some("shard".to_string()),
+                    ..Default::default()
+                });
             }
-        })
-        .collect()
+        }
+    }
+
+    // Stdlib modules
+    for &module in STDLIB_MODULES {
+        if partial.is_empty() || module.starts_with(partial) {
+            items.push(CompletionItem {
+                label: module.to_string(),
+                kind: Some(CompletionItemKind::MODULE),
+                detail: Some("stdlib".to_string()),
+                ..Default::default()
+            });
+        }
+    }
+
+    // Also suggest local .cr files as relative requires
+    let local = list_cr_files(from_dir, partial);
+    for name in local {
+        let insert = format!("./{}", name);
+        items.push(CompletionItem {
+            label: name,
+            kind: Some(CompletionItemKind::FILE),
+            insert_text: Some(insert),
+            detail: Some("relative".to_string()),
+            ..Default::default()
+        });
+    }
+
+    items
+}
+
+/// Walk up from a file's directory to find the `lib/` directory next to a `shard.yml`.
+fn find_lib_dir(file: &Path) -> Option<PathBuf> {
+    let mut dir = file.parent()?;
+    loop {
+        let shard_yml = dir.join("shard.yml");
+        if shard_yml.exists() {
+            let lib = dir.join("lib");
+            if lib.is_dir() {
+                return Some(lib);
+            }
+            return None;
+        }
+        dir = dir.parent()?;
+    }
+}
+
+/// List shard names from a `lib/` directory (each subdirectory is a shard).
+fn list_shard_names(lib_dir: &Path) -> Vec<String> {
+    let entries = match fs::read_dir(lib_dir) {
+        Ok(e) => e,
+        Err(_) => return vec![],
+    };
+    let mut names = Vec::new();
+    for entry in entries.flatten() {
+        if entry.path().is_dir() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with('.') {
+                names.push(name);
+            }
+        }
+    }
+    names.sort();
+    names
 }
 
 /// List `.cr` files in a directory matching a prefix, returning names without extension.
@@ -627,5 +735,126 @@ mod tests {
         let labels = extract_labels(handle(&index, &mut make_parser(), params, Some(source)));
 
         assert!(labels.is_empty(), "should not suggest ivars outside class, got: {:?}", labels);
+    }
+
+    #[test]
+    fn test_require_completion_stdlib_modules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("app.cr");
+        std::fs::write(&app, "").unwrap();
+
+        let index = DocumentIndex::new();
+        let source = "require \"js\n";
+        let params = make_params(app.to_str().unwrap(), 0, 11);
+        let items = extract_items(handle(&index, &mut make_parser(), params, Some(source)));
+
+        let labels: Vec<String> = items.iter().map(|i| i.label.clone()).collect();
+        assert!(labels.contains(&"json".to_string()), "should suggest json, got: {:?}", labels);
+
+        // Verify it's tagged as stdlib
+        let json_item = items.iter().find(|i| i.label == "json").unwrap();
+        assert_eq!(json_item.detail, Some("stdlib".to_string()));
+    }
+
+    #[test]
+    fn test_require_completion_shard_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("lib/kemal/src")).unwrap();
+        std::fs::write(tmp.path().join("lib/kemal/src/kemal.cr"), "").unwrap();
+        std::fs::create_dir_all(tmp.path().join("lib/amber/src")).unwrap();
+        std::fs::write(tmp.path().join("lib/amber/src/amber.cr"), "").unwrap();
+        std::fs::write(tmp.path().join("shard.yml"), "").unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        let app = tmp.path().join("src/app.cr");
+        std::fs::write(&app, "").unwrap();
+
+        let index = DocumentIndex::new();
+        let source = "require \"\n";
+        let params = make_params(app.to_str().unwrap(), 0, 9);
+        let items = extract_items(handle(&index, &mut make_parser(), params, Some(source)));
+
+        let shard_items: Vec<&CompletionItem> = items.iter().filter(|i| i.detail == Some("shard".to_string())).collect();
+        let shard_labels: Vec<&str> = shard_items.iter().map(|i| i.label.as_str()).collect();
+        assert!(shard_labels.contains(&"amber"), "should suggest amber shard, got: {:?}", shard_labels);
+        assert!(shard_labels.contains(&"kemal"), "should suggest kemal shard, got: {:?}", shard_labels);
+    }
+
+    #[test]
+    fn test_require_completion_shard_with_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("lib/kemal/src")).unwrap();
+        std::fs::write(tmp.path().join("lib/kemal/src/kemal.cr"), "").unwrap();
+        std::fs::create_dir_all(tmp.path().join("lib/amber/src")).unwrap();
+        std::fs::write(tmp.path().join("lib/amber/src/amber.cr"), "").unwrap();
+        std::fs::write(tmp.path().join("shard.yml"), "").unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        let app = tmp.path().join("src/app.cr");
+        std::fs::write(&app, "").unwrap();
+
+        let index = DocumentIndex::new();
+        let source = "require \"ke\n";
+        let params = make_params(app.to_str().unwrap(), 0, 11);
+        let items = extract_items(handle(&index, &mut make_parser(), params, Some(source)));
+
+        let shard_items: Vec<&CompletionItem> = items.iter().filter(|i| i.detail == Some("shard".to_string())).collect();
+        let shard_labels: Vec<&str> = shard_items.iter().map(|i| i.label.as_str()).collect();
+        assert!(shard_labels.contains(&"kemal"), "should suggest kemal, got: {:?}", shard_labels);
+        assert!(!shard_labels.contains(&"amber"), "should not suggest amber with prefix 'ke'");
+    }
+
+    #[test]
+    fn test_require_completion_bare_also_shows_relative() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("helper.cr"), "").unwrap();
+        let app = tmp.path().join("app.cr");
+        std::fs::write(&app, "").unwrap();
+
+        let index = DocumentIndex::new();
+        let source = "require \"h\n";
+        let params = make_params(app.to_str().unwrap(), 0, 10);
+        let items = extract_items(handle(&index, &mut make_parser(), params, Some(source)));
+
+        let relative_items: Vec<&CompletionItem> = items.iter().filter(|i| i.detail == Some("relative".to_string())).collect();
+        let rel_labels: Vec<&str> = relative_items.iter().map(|i| i.label.as_str()).collect();
+        assert!(rel_labels.contains(&"helper"), "should suggest local file, got: {:?}", rel_labels);
+
+        // Verify insert_text has ./ prefix
+        let helper = relative_items.iter().find(|i| i.label == "helper").unwrap();
+        assert_eq!(helper.insert_text, Some("./helper".to_string()));
+    }
+
+    #[test]
+    fn test_find_lib_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("shard.yml"), "").unwrap();
+        std::fs::create_dir_all(tmp.path().join("lib/some_shard")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+
+        let app = tmp.path().join("src/app.cr");
+        let result = find_lib_dir(&app);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), tmp.path().join("lib"));
+    }
+
+    #[test]
+    fn test_find_lib_dir_no_shard_yml() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+
+        let app = tmp.path().join("src/app.cr");
+        let result = find_lib_dir(&app);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_list_shard_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lib = tmp.path().join("lib");
+        std::fs::create_dir_all(lib.join("kemal")).unwrap();
+        std::fs::create_dir_all(lib.join("amber")).unwrap();
+        std::fs::create_dir_all(lib.join(".shards")).unwrap(); // hidden, should be excluded
+
+        let names = list_shard_names(&lib);
+        assert_eq!(names, vec!["amber", "kemal"]);
     }
 }

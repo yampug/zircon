@@ -371,11 +371,15 @@ fn publish_pending_diagnostics(
     for path in ready {
         state.pending_diagnostics.remove(&path);
         let source = state.get_source(&path);
-        let syntax_diags = match source {
-            Some(src) => diagnostics::extract_syntax_errors(&mut state.parser, &src),
-            None => Vec::new(),
+        let (syntax_diags, require_diags) = match source {
+            Some(ref src) => (
+                diagnostics::extract_syntax_errors(&mut state.parser, src),
+                diagnostics::extract_require_diagnostics(src, &path),
+            ),
+            None => (Vec::new(), Vec::new()),
         };
         state.diagnostic_store.set_syntax(&path, syntax_diags);
+        state.diagnostic_store.set_require(&path, require_diags);
         if let Some(u) = uri::from_path(&path) {
             let merged = state.diagnostic_store.merged(&path);
             send_diagnostics(connection, u, merged)?;

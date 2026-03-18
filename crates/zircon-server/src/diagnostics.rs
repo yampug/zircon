@@ -9,9 +9,13 @@ use crate::crystal_cli;
 /// Source label for tree-sitter syntax diagnostics.
 pub const SOURCE_SYNTAX: &str = "zircon-syntax";
 
-/// Stores syntax and compiler diagnostics per file, merging them for publishing.
+/// Source label for require path validation diagnostics.
+pub const SOURCE_REQUIRE: &str = "zircon-require";
+
+/// Stores syntax, require, and compiler diagnostics per file, merging them for publishing.
 pub struct DiagnosticStore {
     syntax: HashMap<PathBuf, Vec<Diagnostic>>,
+    require: HashMap<PathBuf, Vec<Diagnostic>>,
     compiler: HashMap<PathBuf, Vec<Diagnostic>>,
 }
 
@@ -19,6 +23,7 @@ impl DiagnosticStore {
     pub fn new() -> Self {
         DiagnosticStore {
             syntax: HashMap::new(),
+            require: HashMap::new(),
             compiler: HashMap::new(),
         }
     }
@@ -26,6 +31,11 @@ impl DiagnosticStore {
     /// Update the syntax (tree-sitter) diagnostics for a file.
     pub fn set_syntax(&mut self, path: &Path, diags: Vec<Diagnostic>) {
         self.syntax.insert(path.to_path_buf(), diags);
+    }
+
+    /// Update the require path validation diagnostics for a file.
+    pub fn set_require(&mut self, path: &Path, diags: Vec<Diagnostic>) {
+        self.require.insert(path.to_path_buf(), diags);
     }
 
     /// Update the compiler diagnostics for a file.
@@ -36,23 +46,29 @@ impl DiagnosticStore {
     /// Clear all diagnostics for a file.
     pub fn clear(&mut self, path: &Path) {
         self.syntax.remove(path);
+        self.require.remove(path);
         self.compiler.remove(path);
     }
 
     /// Return the merged, deduplicated diagnostics for a file.
     ///
-    /// When a compiler diagnostic and a syntax diagnostic overlap on the same
-    /// line, the compiler diagnostic is kept (it is more specific) and the
-    /// syntax diagnostic is dropped.
+    /// When a compiler diagnostic and a syntax/require diagnostic overlap on
+    /// the same line, the compiler diagnostic is kept (it is more specific)
+    /// and the other is dropped.
     pub fn merged(&self, path: &Path) -> Vec<Diagnostic> {
-        let syntax = self.syntax.get(path);
+        let empty = Vec::new();
+        let syntax = self.syntax.get(path).unwrap_or(&empty);
+        let require = self.require.get(path).unwrap_or(&empty);
         let compiler = self.compiler.get(path);
 
-        match (syntax, compiler) {
-            (None, None) => Vec::new(),
-            (Some(s), None) => s.clone(),
-            (None, Some(c)) => c.clone(),
-            (Some(s), Some(c)) => merge_diagnostics(s, c),
+        // Combine syntax + require into one list, then merge against compiler.
+        let mut local: Vec<Diagnostic> = Vec::new();
+        local.extend(syntax.iter().cloned());
+        local.extend(require.iter().cloned());
+
+        match compiler {
+            None => local,
+            Some(c) => merge_diagnostics(&local, c),
         }
     }
 }
@@ -161,6 +177,81 @@ fn make_missing_diagnostic(node: &Node) -> Diagnostic {
         message: format!("Missing `{}`", kind),
         ..Default::default()
     }
+}
+
+/// Extract diagnostics for unresolvable relative require paths.
+///
+/// Only validates relative requires (`./` and `../`). Bare names (shards/stdlib)
+/// cannot be validated without a full project context and are left unchecked.
+pub fn extract_require_diagnostics(source: &str, file_path: &Path) -> Vec<Diagnostic> {
+    let from_dir = match file_path.parent() {
+        Some(d) => d,
+        None => return Vec::new(),
+    };
+
+    let mut diagnostics = Vec::new();
+
+    for (line_num, line) in source.lines().enumerate() {
+        let trimmed = line.trim();
+        let after = match trimmed.strip_prefix("require ") {
+            Some(a) => a.trim(),
+            None => continue,
+        };
+
+        if !(after.starts_with('"') && after.ends_with('"') && after.len() >= 2) {
+            continue;
+        }
+
+        let req_path = &after[1..after.len() - 1];
+        if req_path.is_empty() {
+            continue;
+        }
+
+        // Only validate relative requires.
+        if !req_path.starts_with("./") && !req_path.starts_with("../") {
+            continue;
+        }
+
+        // Skip glob patterns — they're valid even if the directory is empty.
+        if req_path.ends_with("/*") || req_path.ends_with("/**") {
+            continue;
+        }
+
+        let target = from_dir.join(req_path);
+        let with_ext = target.with_extension("cr");
+
+        // Also check Crystal's directory form: require "./foo" → foo/foo.cr
+        let dir_form_exists = if let Some(basename) = target.file_name() {
+            target.join(basename).with_extension("cr").exists()
+        } else {
+            false
+        };
+
+        if !with_ext.exists() && !dir_form_exists {
+            // Find the column positions of the require path string.
+            let col_start = line.find('"').map(|i| i + 1).unwrap_or(0);
+            let col_end = line.rfind('"').unwrap_or(line.len());
+
+            diagnostics.push(Diagnostic {
+                range: Range {
+                    start: Position {
+                        line: line_num as u32,
+                        character: col_start as u32,
+                    },
+                    end: Position {
+                        line: line_num as u32,
+                        character: col_end as u32,
+                    },
+                },
+                severity: Some(DiagnosticSeverity::WARNING),
+                source: Some(SOURCE_REQUIRE.to_string()),
+                message: format!("cannot resolve require \"{}\"", req_path),
+                ..Default::default()
+            });
+        }
+    }
+
+    diagnostics
 }
 
 #[cfg(test)]
@@ -390,5 +481,114 @@ mod tests {
         let store = DiagnosticStore::new();
         let merged = store.merged(Path::new("unknown.cr"));
         assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn test_store_require_diagnostics_merged() {
+        let mut store = DiagnosticStore::new();
+        let path = Path::new("test.cr");
+        store.set_syntax(path, vec![make_diag(0, SOURCE_SYNTAX, "syntax err")]);
+        store.set_require(path, vec![make_diag(2, SOURCE_REQUIRE, "cannot resolve")]);
+
+        let merged = store.merged(path);
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn test_store_require_dedup_against_compiler() {
+        let mut store = DiagnosticStore::new();
+        let path = Path::new("test.cr");
+        store.set_require(path, vec![make_diag(5, SOURCE_REQUIRE, "cannot resolve")]);
+        store.set_compiler(
+            path,
+            vec![make_diag(5, crystal_cli::SOURCE_COMPILER, "file not found")],
+        );
+
+        let merged = store.merged(path);
+        assert_eq!(merged.len(), 1, "compiler should take precedence on same line");
+        assert_eq!(merged[0].message, "file not found");
+    }
+
+    #[test]
+    fn test_require_diagnostics_unresolvable_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("app.cr");
+        std::fs::write(&app, "").unwrap();
+
+        let source = "require \"./nonexistent\"\nrequire \"json\"\n";
+        let diags = extract_require_diagnostics(source, &app);
+
+        assert_eq!(diags.len(), 1, "only relative require should be validated");
+        assert_eq!(diags[0].severity, Some(DiagnosticSeverity::WARNING));
+        assert!(diags[0].message.contains("nonexistent"));
+        assert_eq!(diags[0].source.as_deref(), Some(SOURCE_REQUIRE));
+    }
+
+    #[test]
+    fn test_require_diagnostics_valid_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("models")).unwrap();
+        std::fs::write(tmp.path().join("models/user.cr"), "").unwrap();
+        let app = tmp.path().join("app.cr");
+        std::fs::write(&app, "").unwrap();
+
+        let source = "require \"./models/user\"\n";
+        let diags = extract_require_diagnostics(source, &app);
+
+        assert!(diags.is_empty(), "valid require should produce no diagnostic");
+    }
+
+    #[test]
+    fn test_require_diagnostics_glob_not_flagged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("app.cr");
+        std::fs::write(&app, "").unwrap();
+
+        let source = "require \"./models/*\"\nrequire \"./lib/**\"\n";
+        let diags = extract_require_diagnostics(source, &app);
+
+        assert!(diags.is_empty(), "glob requires should not be flagged");
+    }
+
+    #[test]
+    fn test_require_diagnostics_stdlib_not_flagged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("app.cr");
+        std::fs::write(&app, "").unwrap();
+
+        let source = "require \"json\"\nrequire \"http/server\"\n";
+        let diags = extract_require_diagnostics(source, &app);
+
+        assert!(diags.is_empty(), "stdlib requires should not be flagged");
+    }
+
+    #[test]
+    fn test_require_diagnostics_range_highlights_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let app = tmp.path().join("app.cr");
+        std::fs::write(&app, "").unwrap();
+
+        let source = "require \"./missing\"\n";
+        let diags = extract_require_diagnostics(source, &app);
+
+        assert_eq!(diags.len(), 1);
+        // The diagnostic range should cover the path inside the quotes.
+        assert_eq!(diags[0].range.start.character, 9); // after first "
+        assert_eq!(diags[0].range.end.character, 18); // before last "
+    }
+
+    #[test]
+    fn test_require_diagnostics_directory_form() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Crystal: require "./foo" can resolve to foo/foo.cr
+        std::fs::create_dir_all(tmp.path().join("foo")).unwrap();
+        std::fs::write(tmp.path().join("foo/foo.cr"), "").unwrap();
+        let app = tmp.path().join("app.cr");
+        std::fs::write(&app, "").unwrap();
+
+        let source = "require \"./foo\"\n";
+        let diags = extract_require_diagnostics(source, &app);
+
+        assert!(diags.is_empty(), "directory form require should be valid");
     }
 }
