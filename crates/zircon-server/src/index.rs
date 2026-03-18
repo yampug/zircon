@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -64,11 +64,21 @@ pub struct Symbol {
     pub parent: Option<String>,
 }
 
+/// Tracks the class hierarchy for a single class, struct, or module.
+#[derive(Debug, Clone, Default)]
+pub struct ClassInfo {
+    pub superclass: Option<String>,
+    pub includes: Vec<String>,
+    pub extends: Vec<String>,
+}
+
 /// Parses Crystal source files and maintains a per-file symbol index.
 pub struct DocumentIndex {
     parser: Parser,
     query: Query,
     files: HashMap<PathBuf, Vec<Symbol>>,
+    /// Maps class/module name → hierarchy info (superclass, includes, extends).
+    pub class_hierarchy: HashMap<String, ClassInfo>,
 }
 
 /// Node kinds that represent enclosing scopes for parent tracking.
@@ -92,6 +102,7 @@ impl DocumentIndex {
             parser,
             query,
             files: HashMap::new(),
+            class_hierarchy: HashMap::new(),
         }
     }
 
@@ -108,7 +119,11 @@ impl DocumentIndex {
         match fs::read_to_string(path) {
             Ok(source) => {
                 let symbols = self.extract_symbols(&source);
+                let hierarchy = self.extract_hierarchy(&source);
                 self.files.insert(path.to_path_buf(), symbols);
+                for (name, info) in hierarchy {
+                    self.class_hierarchy.insert(name, info);
+                }
             }
             Err(e) => {
                 warn!("failed to read {:?}: {}", path, e);
@@ -120,7 +135,11 @@ impl DocumentIndex {
     /// incremental updates when the editor sends `didChange`.
     pub fn update_file(&mut self, path: &Path, source: &str) {
         let symbols = self.extract_symbols(source);
+        let hierarchy = self.extract_hierarchy(source);
         self.files.insert(path.to_path_buf(), symbols);
+        for (name, info) in hierarchy {
+            self.class_hierarchy.insert(name, info);
+        }
     }
 
     /// Search all indexed files for definitions matching `name` and `kind`.
@@ -181,6 +200,67 @@ impl DocumentIndex {
             }
         }
         results
+    }
+
+    /// Search for a method by walking the class hierarchy: the class itself,
+    /// then included modules, then the superclass chain.
+    pub fn find_method_in_hierarchy(
+        &self,
+        class_name: &str,
+        method_name: &str,
+    ) -> Vec<(&Path, &Symbol)> {
+        let mut visited = HashSet::new();
+        self.find_method_in_hierarchy_inner(class_name, method_name, &mut visited)
+    }
+
+    fn find_method_in_hierarchy_inner(
+        &self,
+        class_name: &str,
+        method_name: &str,
+        visited: &mut HashSet<String>,
+    ) -> Vec<(&Path, &Symbol)> {
+        if !visited.insert(class_name.to_string()) {
+            return Vec::new();
+        }
+
+        // Check methods defined directly on this class/module.
+        let results: Vec<_> = self
+            .find_by_parent(class_name)
+            .into_iter()
+            .filter(|(_, sym)| sym.name == method_name && sym.kind == SymbolKind::Method)
+            .collect();
+        if !results.is_empty() {
+            return results;
+        }
+
+        if let Some(info) = self.class_hierarchy.get(class_name) {
+            // Check included modules.
+            for module_name in &info.includes {
+                let results =
+                    self.find_method_in_hierarchy_inner(module_name, method_name, visited);
+                if !results.is_empty() {
+                    return results;
+                }
+            }
+
+            // Check superclass.
+            if let Some(ref superclass) = info.superclass {
+                return self.find_method_in_hierarchy_inner(superclass, method_name, visited);
+            }
+        }
+
+        Vec::new()
+    }
+
+    /// Parse source to extract class hierarchy (superclass, include, extend).
+    fn extract_hierarchy(&mut self, source: &str) -> Vec<(String, ClassInfo)> {
+        let tree = match self.parser.parse(source, None) {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+        let mut result = Vec::new();
+        collect_hierarchy(tree.root_node(), source, &mut result);
+        result
     }
 
     /// Extract symbols from Crystal source code using the tags query.
@@ -274,6 +354,74 @@ fn find_parent_scope(node: tree_sitter::Node, source: &str) -> Option<String> {
         current = n.parent();
     }
     None
+}
+
+/// Recursively walk the tree to find class/struct/module definitions and
+/// extract their superclass, include, and extend relationships.
+fn collect_hierarchy(
+    node: tree_sitter::Node,
+    source: &str,
+    result: &mut Vec<(String, ClassInfo)>,
+) {
+    match node.kind() {
+        "class_def" | "struct_def" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                if let Ok(name) = name_node.utf8_text(source.as_bytes()) {
+                    let mut info = ClassInfo::default();
+                    if let Some(super_node) = node.child_by_field_name("superclass") {
+                        if let Ok(s) = super_node.utf8_text(source.as_bytes()) {
+                            info.superclass = Some(s.to_string());
+                        }
+                    }
+                    if let Some(body) = node.child_by_field_name("body") {
+                        collect_includes_extends(body, source, &mut info);
+                    }
+                    result.push((name.to_string(), info));
+                }
+            }
+        }
+        "module_def" => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                if let Ok(name) = name_node.utf8_text(source.as_bytes()) {
+                    let mut info = ClassInfo::default();
+                    if let Some(body) = node.child_by_field_name("body") {
+                        collect_includes_extends(body, source, &mut info);
+                    }
+                    result.push((name.to_string(), info));
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_hierarchy(child, source, result);
+    }
+}
+
+/// Scan a class/module body for `include` and `extend` statements.
+fn collect_includes_extends(body: tree_sitter::Node, source: &str, info: &mut ClassInfo) {
+    let mut cursor = body.walk();
+    for child in body.children(&mut cursor) {
+        match child.kind() {
+            "include" => {
+                if let Some(mod_node) = child.named_child(0) {
+                    if let Ok(name) = mod_node.utf8_text(source.as_bytes()) {
+                        info.includes.push(name.to_string());
+                    }
+                }
+            }
+            "extend" => {
+                if let Some(mod_node) = child.named_child(0) {
+                    if let Ok(name) = mod_node.utf8_text(source.as_bytes()) {
+                        info.extends.push(name.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]
@@ -443,5 +591,57 @@ mod tests {
 
         assert!(d.contains(&("LibC", SymbolKind::Lib, None)));
         assert!(d.contains(&("printf", SymbolKind::Function, Some("LibC"))));
+    }
+
+    #[test]
+    fn test_hierarchy_superclass() {
+        let mut idx = DocumentIndex::new();
+        idx.update_file(
+            Path::new("a.cr"),
+            "class Animal\n  def breathe\n  end\nend\n\nclass Dog < Animal\n  def bark\n  end\nend\n",
+        );
+
+        let info = idx.class_hierarchy.get("Dog").expect("Dog should be in hierarchy");
+        assert_eq!(info.superclass.as_deref(), Some("Animal"));
+
+        // Method defined directly on Dog.
+        let bark = idx.find_method_in_hierarchy("Dog", "bark");
+        assert_eq!(bark.len(), 1);
+        assert_eq!(bark[0].1.name, "bark");
+
+        // Method inherited from Animal.
+        let breathe = idx.find_method_in_hierarchy("Dog", "breathe");
+        assert_eq!(breathe.len(), 1);
+        assert_eq!(breathe[0].1.name, "breathe");
+        assert_eq!(breathe[0].1.parent.as_deref(), Some("Animal"));
+    }
+
+    #[test]
+    fn test_hierarchy_includes() {
+        let mut idx = DocumentIndex::new();
+        idx.update_file(
+            Path::new("a.cr"),
+            "module Greetable\n  def greet\n  end\nend\n\nclass Person\n  include Greetable\n  def name\n  end\nend\n",
+        );
+
+        let info = idx.class_hierarchy.get("Person").expect("Person in hierarchy");
+        assert_eq!(info.includes, vec!["Greetable"]);
+
+        // Method from included module.
+        let greet = idx.find_method_in_hierarchy("Person", "greet");
+        assert_eq!(greet.len(), 1);
+        assert_eq!(greet[0].1.parent.as_deref(), Some("Greetable"));
+    }
+
+    #[test]
+    fn test_hierarchy_not_found() {
+        let mut idx = DocumentIndex::new();
+        idx.update_file(
+            Path::new("a.cr"),
+            "class Foo\n  def bar\n  end\nend\n",
+        );
+
+        let results = idx.find_method_in_hierarchy("Foo", "nonexistent");
+        assert!(results.is_empty());
     }
 }

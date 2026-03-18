@@ -3,7 +3,7 @@ use std::path::Path;
 use lsp_types::{GotoDefinitionParams, GotoDefinitionResponse, Location, Position, Range};
 use tree_sitter::{Parser, Point};
 
-use crate::index::{DocumentIndex, SymbolKind};
+use crate::index::{DocumentIndex, Symbol, SymbolKind};
 use crate::uri;
 
 /// Handle a `textDocument/definition` request.
@@ -26,9 +26,19 @@ pub fn handle(
     };
     let node = tree.root_node().descendant_for_point_range(point, point)?;
 
+    // Try type-aware resolution for method calls on typed receivers.
+    if let Some(typed_results) = try_type_aware_resolution(index, source, &tree, node) {
+        let mut results = typed_results;
+        sort_results(&mut results, &path);
+        let locations = results_to_locations(&results);
+        if !locations.is_empty() {
+            return Some(GotoDefinitionResponse::Array(locations));
+        }
+    }
+
+    // Fall back to name-based search.
     let (name, kinds) = classify_node(node, source)?;
 
-    // Search the index, prioritizing current file.
     let mut results: Vec<(&Path, _)> = Vec::new();
     if kinds.is_empty() {
         results = index.find_by_name(&name);
@@ -42,14 +52,23 @@ pub fn handle(
         return Some(GotoDefinitionResponse::Array(vec![]));
     }
 
-    // Sort: current file first, then alphabetically by path.
+    sort_results(&mut results, &path);
+    let locations = results_to_locations(&results);
+    Some(GotoDefinitionResponse::Array(locations))
+}
+
+/// Sort definition results: current file first, then alphabetically.
+fn sort_results(results: &mut [(&Path, &Symbol)], current_path: &Path) {
     results.sort_by(|a, b| {
-        let a_local = a.0 == path.as_path();
-        let b_local = b.0 == path.as_path();
+        let a_local = a.0 == current_path;
+        let b_local = b.0 == current_path;
         b_local.cmp(&a_local).then_with(|| a.0.cmp(b.0))
     });
+}
 
-    let locations: Vec<Location> = results
+/// Convert symbol results to LSP Location objects.
+fn results_to_locations(results: &[(&Path, &Symbol)]) -> Vec<Location> {
+    results
         .iter()
         .filter_map(|(p, sym)| {
             let u = uri::from_path(p)?;
@@ -67,9 +86,216 @@ pub fn handle(
                 },
             })
         })
-        .collect();
+        .collect()
+}
 
-    Some(GotoDefinitionResponse::Array(locations))
+// ---------------------------------------------------------------------------
+// Type-aware resolution
+// ---------------------------------------------------------------------------
+
+/// Attempt to resolve a method call by inferring the receiver's type and
+/// searching the class hierarchy. Returns `None` if the node is not a method
+/// call on a receiver, or if the type cannot be inferred.
+fn try_type_aware_resolution<'a>(
+    index: &'a DocumentIndex,
+    source: &str,
+    _tree: &tree_sitter::Tree,
+    node: tree_sitter::Node,
+) -> Option<Vec<(&'a Path, &'a Symbol)>> {
+    let parent = node.parent()?;
+    if parent.kind() != "call" {
+        return None;
+    }
+
+    // Make sure the cursor node is the method name, not the receiver.
+    let method_node = parent.child_by_field_name("method")?;
+    if method_node.id() != node.id() {
+        return None;
+    }
+
+    let receiver_node = parent.child_by_field_name("receiver")?;
+    let method_name = node.utf8_text(source.as_bytes()).ok()?;
+
+    let type_name = infer_receiver_type(receiver_node, source)?;
+    let results = index.find_method_in_hierarchy(&type_name, method_name);
+    if results.is_empty() {
+        return None; // fall back to name-based search
+    }
+    Some(results)
+}
+
+/// Infer the type of a receiver node.
+fn infer_receiver_type(
+    receiver_node: tree_sitter::Node,
+    source: &str,
+) -> Option<String> {
+    let text = receiver_node.utf8_text(source.as_bytes()).ok()?;
+
+    // Receiver is a constant → direct class/module reference (e.g. User.new).
+    if receiver_node.kind() == "constant" || text.chars().next()?.is_uppercase() {
+        return Some(text.to_string());
+    }
+
+    // Receiver is a local variable → scan the enclosing scope for its type.
+    if receiver_node.kind() == "identifier" {
+        return infer_variable_type(text, source, receiver_node);
+    }
+
+    // Receiver is itself a call ending in .new (e.g. User.new.to_s) — rare.
+    if receiver_node.kind() == "call" {
+        return extract_constructor_type(receiver_node, source);
+    }
+
+    None
+}
+
+/// Scan the enclosing scope for a variable's type — from type annotations in
+/// method parameters, type declarations, or `Foo.new` assignments.
+fn infer_variable_type(
+    var_name: &str,
+    source: &str,
+    context: tree_sitter::Node,
+) -> Option<String> {
+    let scope = find_enclosing_scope(context)?;
+
+    // Check method parameters first.
+    if scope.kind() == "method_def" || scope.kind() == "abstract_method_def" {
+        if let Some(params) = scope.child_by_field_name("params") {
+            if let Some(t) = find_param_type(params, var_name, source) {
+                return Some(t);
+            }
+        }
+    }
+
+    // Walk scope children for assignments / type declarations.
+    infer_from_children(scope, var_name, source)
+}
+
+fn find_enclosing_scope(node: tree_sitter::Node) -> Option<tree_sitter::Node> {
+    let mut cur = Some(node);
+    while let Some(n) = cur {
+        match n.kind() {
+            "method_def" | "abstract_method_def" | "class_def" | "module_def"
+            | "struct_def" | "block" | "program" | "expressions" => return Some(n),
+            _ => cur = n.parent(),
+        }
+    }
+    None
+}
+
+fn find_param_type(
+    params: tree_sitter::Node,
+    var_name: &str,
+    source: &str,
+) -> Option<String> {
+    let mut cursor = params.walk();
+    for child in params.children(&mut cursor) {
+        if child.kind() != "param" {
+            continue;
+        }
+        let name_node = child.child_by_field_name("name")?;
+        let name = name_node.utf8_text(source.as_bytes()).ok()?;
+        if name != var_name {
+            continue;
+        }
+        let type_node = child.child_by_field_name("type")?;
+        return extract_type_name(type_node, source);
+    }
+    None
+}
+
+fn infer_from_children(
+    node: tree_sitter::Node,
+    var_name: &str,
+    source: &str,
+) -> Option<String> {
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "assign" => {
+                if let Some(t) = infer_from_assign(child, var_name, source) {
+                    return Some(t);
+                }
+            }
+            "type_declaration" => {
+                if let Some(t) = infer_from_type_decl(child, var_name, source) {
+                    return Some(t);
+                }
+            }
+            _ => {
+                // Recurse into blocks / if-else / etc.
+                if let Some(t) = infer_from_children(child, var_name, source) {
+                    return Some(t);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn infer_from_assign(
+    node: tree_sitter::Node,
+    var_name: &str,
+    source: &str,
+) -> Option<String> {
+    let lhs = node.child_by_field_name("lhs")?;
+    let lhs_text = lhs.utf8_text(source.as_bytes()).ok()?;
+    if lhs_text != var_name {
+        return None;
+    }
+    let rhs = node.child_by_field_name("rhs")?;
+    extract_constructor_type(rhs, source)
+}
+
+fn infer_from_type_decl(
+    node: tree_sitter::Node,
+    var_name: &str,
+    source: &str,
+) -> Option<String> {
+    let var_node = node.child_by_field_name("var")?;
+    let var_text = var_node.utf8_text(source.as_bytes()).ok()?;
+    if var_text != var_name {
+        return None;
+    }
+    let type_node = node.child_by_field_name("type")?;
+    extract_type_name(type_node, source)
+}
+
+/// Extract the class name from a `ClassName.new` call node.
+fn extract_constructor_type(
+    node: tree_sitter::Node,
+    source: &str,
+) -> Option<String> {
+    if node.kind() != "call" {
+        return None;
+    }
+    let method = node.child_by_field_name("method")?;
+    let method_text = method.utf8_text(source.as_bytes()).ok()?;
+    if method_text != "new" {
+        return None;
+    }
+    let receiver = node.child_by_field_name("receiver")?;
+    let name = receiver.utf8_text(source.as_bytes()).ok()?;
+    if name.chars().next()?.is_uppercase() {
+        Some(name.to_string())
+    } else {
+        None
+    }
+}
+
+/// Pull the base type name from a type node, stripping `?` and generics.
+fn extract_type_name(
+    type_node: tree_sitter::Node,
+    source: &str,
+) -> Option<String> {
+    let text = type_node.utf8_text(source.as_bytes()).ok()?;
+    let base = text.trim().trim_end_matches('?');
+    let name = base.split('(').next()?.trim();
+    if name.chars().next()?.is_uppercase() {
+        Some(name.to_string())
+    } else {
+        None
+    }
 }
 
 /// Classify a tree-sitter node to determine the symbol name and which
@@ -313,4 +539,135 @@ mod tests {
             other => panic!("expected Array, got {:?}", other),
         }
     }
+
+    #[test]
+    fn test_type_aware_constructor_resolution() {
+        // `user = User.new` followed by `user.name` should resolve to User#name
+        // and NOT to an unrelated `name` method on another class.
+        let mut index = DocumentIndex::new();
+        let file_a = PathBuf::from("/tmp/user.cr");
+        let file_b = PathBuf::from("/tmp/pet.cr");
+        let file_c = PathBuf::from("/tmp/main.cr");
+
+        let source_a = "class User\n  def name\n    \"alice\"\n  end\nend\n";
+        let source_b = "class Pet\n  def name\n    \"fido\"\n  end\nend\n";
+        let source_c = "user = User.new\nuser.name\n";
+
+        index.update_file(&file_a, source_a);
+        index.update_file(&file_b, source_b);
+        index.update_file(&file_c, source_c);
+
+        let mut parser = make_parser();
+        // Cursor on "name" in `user.name` at line 1, col 5
+        let params = make_params("/tmp/main.cr", 1, 5);
+
+        let result = handle(&index, &mut parser, params, Some(source_c));
+
+        match result {
+            Some(GotoDefinitionResponse::Array(locs)) => {
+                assert_eq!(locs.len(), 1, "should find exactly one definition");
+                let uri_a = uri::from_path(&file_a).unwrap();
+                assert_eq!(locs[0].uri, uri_a, "should resolve to User#name");
+                assert_eq!(locs[0].range.start.line, 1);
+            }
+            other => panic!("expected Array, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_type_aware_superclass_resolution() {
+        // `child.greet` where Child < Parent should resolve to Parent#greet
+        let mut index = DocumentIndex::new();
+        let file_a = PathBuf::from("/tmp/parent.cr");
+        let file_b = PathBuf::from("/tmp/child.cr");
+        let file_c = PathBuf::from("/tmp/run.cr");
+
+        let source_a = "class Parent\n  def greet\n    \"hello\"\n  end\nend\n";
+        let source_b = "class Child < Parent\nend\n";
+        let source_c = "c = Child.new\nc.greet\n";
+
+        index.update_file(&file_a, source_a);
+        index.update_file(&file_b, source_b);
+        index.update_file(&file_c, source_c);
+
+        let mut parser = make_parser();
+        // Cursor on "greet" in `c.greet` at line 1, col 2
+        let params = make_params("/tmp/run.cr", 1, 2);
+
+        let result = handle(&index, &mut parser, params, Some(source_c));
+
+        match result {
+            Some(GotoDefinitionResponse::Array(locs)) => {
+                assert!(!locs.is_empty(), "should find inherited method");
+                let uri_a = uri::from_path(&file_a).unwrap();
+                assert_eq!(locs[0].uri, uri_a, "should resolve to Parent#greet");
+                assert_eq!(locs[0].range.start.line, 1);
+            }
+            other => panic!("expected Array, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_type_aware_include_resolution() {
+        // `obj.say_hi` where Greeter includes Greetable should resolve
+        // to Greetable#say_hi
+        let mut index = DocumentIndex::new();
+        let file_a = PathBuf::from("/tmp/greetable.cr");
+        let file_b = PathBuf::from("/tmp/greeter.cr");
+        let file_c = PathBuf::from("/tmp/use.cr");
+
+        let source_a = "module Greetable\n  def say_hi\n    \"hi\"\n  end\nend\n";
+        let source_b = "class Greeter\n  include Greetable\nend\n";
+        let source_c = "g = Greeter.new\ng.say_hi\n";
+
+        index.update_file(&file_a, source_a);
+        index.update_file(&file_b, source_b);
+        index.update_file(&file_c, source_c);
+
+        let mut parser = make_parser();
+        // Cursor on "say_hi" in `g.say_hi` at line 1, col 2
+        let params = make_params("/tmp/use.cr", 1, 2);
+
+        let result = handle(&index, &mut parser, params, Some(source_c));
+
+        match result {
+            Some(GotoDefinitionResponse::Array(locs)) => {
+                assert!(!locs.is_empty(), "should find included method");
+                let uri_a = uri::from_path(&file_a).unwrap();
+                assert_eq!(locs[0].uri, uri_a, "should resolve to Greetable#say_hi");
+                assert_eq!(locs[0].range.start.line, 1);
+            }
+            other => panic!("expected Array, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_type_aware_fallback() {
+        // When receiver type can't be inferred, falls back to name-based search.
+        let mut index = DocumentIndex::new();
+        let file_a = PathBuf::from("/tmp/defs.cr");
+        let file_b = PathBuf::from("/tmp/call.cr");
+
+        let source_a = "class Foo\n  def do_thing\n  end\nend\n";
+        // `x` has no visible assignment, so type can't be inferred
+        let source_b = "x.do_thing\n";
+
+        index.update_file(&file_a, source_a);
+        index.update_file(&file_b, source_b);
+
+        let mut parser = make_parser();
+        // Cursor on "do_thing" at line 0, col 2
+        let params = make_params("/tmp/call.cr", 0, 2);
+
+        let result = handle(&index, &mut parser, params, Some(source_b));
+
+        match result {
+            Some(GotoDefinitionResponse::Array(locs)) => {
+                // Should fall back to name-based and still find Foo#do_thing
+                assert!(!locs.is_empty(), "fallback should find do_thing");
+            }
+            other => panic!("expected Array, got {:?}", other),
+        }
+    }
 }
+
